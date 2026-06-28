@@ -15,6 +15,16 @@ import tkinter as tk
 from tkinter import ttk, font as tkfont
 import ctypes
 from ctypes import wintypes
+import urllib.request
+import io
+
+EMOTE_CACHE_DIR = "emote_cache"
+_emote_images = {}
+_emote_frames = {}
+_emote_delays = {}
+_emote_is_animated = {}
+_emote_download_lock = threading.Lock()
+_animated_canvas_items = {}
 
 try:
     import win32gui
@@ -368,6 +378,9 @@ class GhostOverlay:
         self.msg_block_spacing = 10
         self.name_to_msg_gap  = 3
         self.settings_border_ids = []
+        self._animated_items = {}
+        self._animation_running = True
+        self.root.after(50, self._animate_emotes_loop)
 
         self.root.after(50,  self._make_click_through)
         self.root.after(200, self._make_click_through)
@@ -463,6 +476,44 @@ class GhostOverlay:
             except Exception:
                 pass
 
+    def _animate_emotes_loop(self):
+        if not self.running or not self._animation_running:
+            return
+
+        items_to_remove = []
+
+        for item_id, info in self._animated_items.items():
+            emote_id = info['emote_id']
+            frames = _emote_frames.get(emote_id)
+            delays = _emote_delays.get(emote_id)
+
+            if not frames or not delays:
+                continue
+
+            try:
+                self.canvas.coords(item_id)
+            except tk.TclError:
+                items_to_remove.append(item_id)
+                continue
+
+            info['frame_idx'] = (info['frame_idx'] + 1) % len(frames)
+            try:
+                self.canvas.itemconfig(item_id, image=frames[info['frame_idx']])
+            except tk.TclError:
+                items_to_remove.append(item_id)
+
+        for item_id in items_to_remove:
+            self._animated_items.pop(item_id, None)
+
+        self.root.after(80, self._animate_emotes_loop)
+
+    def _register_animated_item(self, canvas_item_id, emote_id):
+        if _emote_is_animated.get(emote_id, False):
+            self._animated_items[canvas_item_id] = {
+                'emote_id': emote_id,
+                'frame_idx': 0,
+            }
+
     def _wrap_to_lines(self, text, max_width, font):
         text = re.sub(r'\s+', ' ', text).strip()
         if not text:
@@ -520,6 +571,7 @@ class GhostOverlay:
             removed_height += block['height']
         for block in blocks_to_remove:
             for item_id in block['items']:
+                self._animated_items.pop(item_id, None)
                 try:
                     self.canvas.delete(item_id)
                 except Exception:
@@ -535,6 +587,7 @@ class GhostOverlay:
             extra_h = sum(b['height'] for b in extra)
             for block in extra:
                 for item_id in block['items']:
+                    self._animated_items.pop(item_id, None)
                     try:
                         self.canvas.delete(item_id)
                     except Exception:
@@ -599,12 +652,13 @@ class GhostOverlay:
         return pill_h, cur_x + name_w + pad_x*2
 
     def add_chat_message(self, username, message,
-                         name_color='#9146FF', msg_color=None, badge=None):
+                         name_color='#9146FF', msg_color=None, badge=None,
+                         emotes_raw=""):
         if msg_color is None:
             msg_color = self.cfg.get('text_color', '#FFFFFF')
         with self._queue_lock:
             self._message_queue.append(
-                ('chat', username, message, name_color, msg_color, badge)
+                ('chat', username, message, name_color, msg_color, badge, emotes_raw)
             )
 
     def add_system_message(self, message, color='#AAAAAA'):
@@ -641,6 +695,7 @@ class GhostOverlay:
     def _do_clear(self):
         self.canvas.delete('msg')
         self.message_blocks = []
+        self._animated_items = {}
 
     def _render_message(self, msg):
         msg_type  = msg[0]
@@ -648,7 +703,7 @@ class GhostOverlay:
         items     = []
 
         if msg_type == 'system':
-            _, _, message, color, _, _ = msg
+            _, _, message, color, _, _ = msg[:6]
             lines   = self._wrap_to_lines("» " + message, max_width, self.text_font)
             total_h = len(lines) * self.line_spacing + self.msg_block_spacing
             self._make_space(total_h)
@@ -661,10 +716,57 @@ class GhostOverlay:
             return
 
         if msg_type == 'chat':
-            _, username, message, name_color, msg_color, badge = msg
+            _, username, message, name_color, msg_color, badge = msg[:6]
+            emotes_raw = msg[6] if len(msg) > 6 else ""
+            
+            emotes_list = parse_emotes_tag(emotes_raw, message)
+            
+            if emotes_list:
+                self._render_chat_with_emotes(
+                    username, message, name_color, msg_color, badge,
+                    emotes_list, max_width, items
+                )
+            else:
+                msg_lines = self._wrap_to_lines(message, max_width, self.text_font)
+                header_h  = self.name_line_height
+                total_h   = (header_h + self.name_to_msg_gap
+                            + len(msg_lines) * self.line_spacing
+                            + self.msg_block_spacing)
+                self._make_space(total_h)
+                start_y = self._get_current_bottom()
+                y = start_y
+                self._draw_name_header(self.padding, y, badge, username, name_color, items)
+                y += header_h + self.name_to_msg_gap
+                for line in msg_lines:
+                    self._draw_outlined_text(
+                        self.padding + 4, y, line, self.text_font, msg_color, items
+                    )
+                    y += self.line_spacing
+                self.message_blocks.append(
+                    {'start_y': start_y, 'height': total_h, 'items': items}
+                )
+
+    def _render_chat_with_emotes(self, username, message, name_color, msg_color,
+                                  badge, emotes_list, max_width, items):
+        """Рендерит сообщение с инлайн-эмотами (картинками)."""
+        parts = split_message_with_emotes(message, emotes_list)
+
+        emote_photos = {}
+        for part in parts:
+            if part[0] == 'emote':
+                eid = part[1]
+                if eid not in emote_photos:
+                    photo = get_emote_photo(eid, self.root)
+                    emote_photos[eid] = photo
+
+        has_real_emotes = any(v is not None for v in emote_photos.values())
+
+        if not has_real_emotes:
             msg_lines = self._wrap_to_lines(message, max_width, self.text_font)
-            header_h  = self.name_line_height
-            total_h   = header_h + self.name_to_msg_gap + len(msg_lines) * self.line_spacing + self.msg_block_spacing
+            header_h = self.name_line_height
+            total_h = (header_h + self.name_to_msg_gap
+                       + len(msg_lines) * self.line_spacing
+                       + self.msg_block_spacing)
             self._make_space(total_h)
             start_y = self._get_current_bottom()
             y = start_y
@@ -675,7 +777,168 @@ class GhostOverlay:
                     self.padding + 4, y, line, self.text_font, msg_color, items
                 )
                 y += self.line_spacing
-            self.message_blocks.append({'start_y': start_y, 'height': total_h, 'items': items})
+            self.message_blocks.append(
+                {'start_y': start_y, 'height': total_h, 'items': items}
+            )
+            return
+
+        # --- Константы отступов ---
+        EMOTE_SIZE = 22
+        EMOTE_W = EMOTE_SIZE + 6    # ширина эмота + отступ справа
+        EMOTE_H = EMOTE_SIZE
+        EMOTE_PAD_LEFT = 3           # отступ слева от эмота (от текста к эмоту)
+        EMOTE_PAD_RIGHT = 3          # отступ справа от эмота (от эмота к тексту)
+        indent = 4
+        NAME_TO_MSG_GAP = max(self.name_to_msg_gap, 6)  # увеличенный зазор под ником
+
+        # --- Разбиваем на визуальные строки ---
+        lines_content = []
+        current_line = []
+        current_line_w = 0
+
+        for pi, part in enumerate(parts):
+            if part[0] == 'text':
+                text = part[1]
+                if not text:
+                    continue
+                words = text.split(' ')
+                for wi, word in enumerate(words):
+                    if not word:
+                        # Пустое слово = был пробел, добавляем пробел-отступ
+                        if current_line:
+                            space_w = self.text_font.measure(' ')
+                            current_line_w += space_w
+                        continue
+
+                    # Добавляем пробел перед словом если не начало строки
+                    word_display = word
+                    need_space = False
+                    if current_line and wi > 0:
+                        need_space = True
+                    elif current_line and wi == 0:
+                        # Проверяем: предыдущий элемент в current_line — 
+                        # если это эмот, нужен пробел
+                        if current_line[-1][0] == 'emote':
+                            need_space = True
+
+                    if need_space:
+                        word_display = ' ' + word
+
+                    w = self.text_font.measure(word_display)
+
+                    if current_line_w + w > max_width - indent and current_line:
+                        lines_content.append(current_line)
+                        current_line = []
+                        current_line_w = 0
+                        word_display = word
+                        w = self.text_font.measure(word_display)
+
+                    current_line.append(('text', word_display))
+                    current_line_w += w
+
+            elif part[0] == 'emote':
+                eid = part[1]
+                ename = part[2] if len(part) > 2 else ""
+
+                total_emote_w = EMOTE_PAD_LEFT + EMOTE_W + EMOTE_PAD_RIGHT
+
+                # Если перед эмотом есть текст — нужен отступ
+                if current_line:
+                    total_emote_w_check = total_emote_w
+                else:
+                    total_emote_w_check = EMOTE_W + EMOTE_PAD_RIGHT
+
+                if current_line_w + total_emote_w_check > max_width - indent and current_line:
+                    lines_content.append(current_line)
+                    current_line = []
+                    current_line_w = 0
+
+                if emote_photos.get(eid) is not None:
+                    current_line.append(('emote', eid))
+                    if current_line_w > 0:
+                        current_line_w += EMOTE_PAD_LEFT + EMOTE_W + EMOTE_PAD_RIGHT
+                    else:
+                        current_line_w += EMOTE_W + EMOTE_PAD_RIGHT
+                else:
+                    fallback = ename or f":{eid}:"
+                    if current_line:
+                        fallback = ' ' + fallback
+                    w = self.text_font.measure(fallback)
+                    current_line.append(('text', fallback))
+                    current_line_w += w
+
+        if current_line:
+            lines_content.append(current_line)
+
+        if not lines_content:
+            lines_content = [[('text', message)]]
+
+        # --- Расчёт высоты ---
+        header_h = self.name_line_height
+        text_line_h = self.line_spacing
+        emote_line_h = max(self.line_spacing, EMOTE_H + 6)
+
+        # Определяем высоту каждой строки
+        line_heights = []
+        for line_parts in lines_content:
+            has_emote_in_line = any(lp[0] == 'emote' for lp in line_parts)
+            if has_emote_in_line:
+                line_heights.append(emote_line_h)
+            else:
+                line_heights.append(text_line_h)
+
+        total_content_h = sum(line_heights)
+        total_h = header_h + NAME_TO_MSG_GAP + total_content_h + self.msg_block_spacing
+
+        self._make_space(total_h)
+        start_y = self._get_current_bottom()
+        y = start_y
+
+        # --- Рисуем ник ---
+        self._draw_name_header(self.padding, y, badge, username, name_color, items)
+        y += header_h + NAME_TO_MSG_GAP
+
+        # --- Рисуем строки контента ---
+        for line_idx, line_parts in enumerate(lines_content):
+            x = self.padding + indent
+            line_h = line_heights[line_idx]
+            has_emote_in_line = any(lp[0] == 'emote' for lp in line_parts)
+
+            # Вертикальный центр строки для выравнивания текста и эмотов
+            text_baseline_y = y + (line_h - self.text_font.metrics('linespace')) // 2
+
+            for lpi, lp in enumerate(line_parts):
+                if lp[0] == 'text':
+                    text_str = lp[1]
+                    if text_str:
+                        self._draw_outlined_text(
+                            x, text_baseline_y, text_str,
+                            self.text_font, msg_color, items
+                        )
+                        x += self.text_font.measure(text_str)
+
+                elif lp[0] == 'emote':
+                    eid = lp[1]
+                    photo = emote_photos.get(eid)
+                    if photo:
+                        if lpi > 0:
+                            x += EMOTE_PAD_LEFT
+
+                        emote_y = y + (line_h - EMOTE_H) // 2
+                        img_id = self.canvas.create_image(
+                            x, emote_y, image=photo, anchor='nw', tags='msg'
+                        )
+                        items.append(img_id)
+
+                        self._register_animated_item(img_id, eid)
+
+                        x += EMOTE_SIZE + EMOTE_PAD_RIGHT
+
+            y += line_h
+
+        self.message_blocks.append(
+            {'start_y': start_y, 'height': total_h, 'items': items}
+        )
 
     def update_config(self, new_cfg):
         old_w = self.cfg['width']
@@ -708,6 +971,8 @@ class GhostOverlay:
 
     def close(self):
         self.running = False
+        self._animation_running = False
+        self._animated_items = {}
         try:
             self.root.quit()
             self.root.destroy()
@@ -1308,6 +1573,156 @@ def save_stats_snapshot():
         pass
 
 
+def parse_emotes_tag(emotes_str, message_text):
+    """
+    Парсит тег emotes из IRC.
+    Формат: "emote_id:start-end,start-end/emote_id:start-end"
+    Возвращает список (start, end, emote_id) отсортированный по позиции.
+    """
+    if not emotes_str:
+        return []
+    
+    result = []
+    try:
+        for emote_block in emotes_str.split("/"):
+            if ":" not in emote_block:
+                continue
+            emote_id, positions = emote_block.split(":", 1)
+            for pos in positions.split(","):
+                if "-" not in pos:
+                    continue
+                start_s, end_s = pos.split("-", 1)
+                start = int(start_s)
+                end = int(end_s) + 1
+                result.append((start, end, emote_id))
+    except Exception:
+        return []
+    
+    result.sort(key=lambda x: x[0])
+    return result
+
+
+def get_emote_path(emote_id):
+    """Возвращает путь к кешированной картинке эмота."""
+    os.makedirs(EMOTE_CACHE_DIR, exist_ok=True)
+    return os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.png")
+
+
+def download_emote(emote_id):
+    gif_path = os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.gif")
+    png_path = os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.png")
+    os.makedirs(EMOTE_CACHE_DIR, exist_ok=True)
+
+    if os.path.exists(gif_path):
+        return gif_path
+    if os.path.exists(png_path):
+        return png_path
+
+    animated_url = f"https://static-cdn.jtvnw.net/emoticons/v2/{emote_id}/animated/dark/1.0"
+    static_url = f"https://static-cdn.jtvnw.net/emoticons/v2/{emote_id}/default/dark/1.0"
+
+    for url, save_path in [(animated_url, gif_path), (static_url, png_path)]:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'TwitchOverlay/1.0'})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read()
+            if len(data) > 100:  # валидный ответ
+                with open(save_path, 'wb') as f:
+                    f.write(data)
+                return save_path
+        except Exception:
+            continue
+
+    return None
+
+
+def get_emote_photo(emote_id, root):
+    if emote_id in _emote_images:
+        return _emote_images[emote_id]
+
+    if not PIL_OK:
+        return None
+
+    with _emote_download_lock:
+        if emote_id in _emote_images:
+            return _emote_images[emote_id]
+
+        path = download_emote(emote_id)
+        if not path:
+            _emote_images[emote_id] = None
+            return None
+
+        try:
+            from PIL import ImageTk
+
+            pil_img = Image.open(path)
+
+            is_animated = getattr(pil_img, 'is_animated', False)
+            n_frames = getattr(pil_img, 'n_frames', 1)
+
+            if is_animated and n_frames > 1:
+                frames = []
+                delays = []
+
+                for i in range(n_frames):
+                    pil_img.seek(i)
+                    frame = pil_img.copy().convert('RGBA')
+                    frame = frame.resize((22, 22), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(frame, master=root)
+                    frames.append(photo)
+
+                    delay = pil_img.info.get('duration', 100)
+                    if delay < 20:
+                        delay = 100
+                    delays.append(delay)
+
+                _emote_frames[emote_id] = frames
+                _emote_delays[emote_id] = delays
+                _emote_is_animated[emote_id] = True
+                _emote_images[emote_id] = frames[0]
+                return frames[0]
+            else:
+                frame = pil_img.convert('RGBA').resize((22, 22), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(frame, master=root)
+                _emote_images[emote_id] = photo
+                _emote_is_animated[emote_id] = False
+                return photo
+
+        except Exception as e:
+            log_to_gui(f"Emote load error {emote_id}: {e}", "WARN")
+            _emote_images[emote_id] = None
+            return None
+
+
+def split_message_with_emotes(message, emotes_list):
+    """
+    Разбивает сообщение на куски: текст и эмоты.
+    Возвращает список: [('text', 'hello '), ('emote', 'emote_id', 'Kappa'), ('text', ' world')]
+    """
+    if not emotes_list:
+        return [('text', message)]
+    
+    parts = []
+    last_end = 0
+    
+    for start, end, emote_id in emotes_list:
+        if start > last_end:
+            text_chunk = message[last_end:start]
+            if text_chunk:
+                parts.append(('text', text_chunk))
+        
+        emote_name = message[start:end] if end <= len(message) else ""
+        parts.append(('emote', emote_id, emote_name))
+        last_end = end
+    
+    if last_end < len(message):
+        remaining = message[last_end:]
+        if remaining:
+            parts.append(('text', remaining))
+    
+    return parts if parts else [('text', message)]
+
+
 def parse_irc_message(line):
     if not line:
         return None, None, None, {}
@@ -1496,9 +1911,20 @@ def chat_loop(overlay: GhostOverlay):
                     log_chat_to_gui(username, message, badges)
                     with connection_lock:
                         connection_state['last_activity'] = time.time()
+                    # Предзагрузка эмотов в фоне
+                    emotes_raw_str = tags.get("emotes", "")
+                    if emotes_raw_str:
+                        emotes_parsed = parse_emotes_tag(emotes_raw_str, message)
+                        for _, _, eid in emotes_parsed:
+                            if not os.path.exists(get_emote_path(eid)):
+                                threading.Thread(
+                                    target=download_emote, args=(eid,),
+                                    daemon=True
+                                ).start()
                     overlay.add_chat_message(username, message,
                         name_color=color or '#9146FF',
-                        msg_color='#FFFFFF', badge=badge_icon)
+                        msg_color='#FFFFFF', badge=badge_icon,
+                        emotes_raw=tags.get("emotes", ""))
 
             if time.time() - last_stats_save > 60:
                 save_stats_snapshot()
