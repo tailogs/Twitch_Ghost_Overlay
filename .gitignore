@@ -163,3 +163,4 @@ app_state.json
 heartbeat.tmp
 supervisor_state.json
 emote_cache/
+alerts_config.json

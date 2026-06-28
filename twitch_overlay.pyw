@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from collections import defaultdict
 import tkinter as tk
-from tkinter import ttk, font as tkfont
+from tkinter import ttk, font as tkfont, filedialog
 import ctypes
 from ctypes import wintypes
 import urllib.request
@@ -66,6 +66,20 @@ DEFAULT_APP_STATE = {
     "last_channel": "",
     "language": "en",
 }
+
+ALERTS_CONFIG_FILE = "alerts_config.json"
+
+DEFAULT_ALERTS_CONFIG = {
+    "alerts": [],
+    "cooldown": 10,
+    "enabled": True,
+}
+
+_alerts_config = DEFAULT_ALERTS_CONFIG.copy()
+_alert_last_fired = {}
+_alert_image_cache = {}
+_alert_lock = threading.Lock()
+
 
 TRANSLATIONS = {
     "en": {
@@ -150,6 +164,7 @@ TRANSLATIONS = {
         "ov_conn_error": "✗ Connection error: {e}",
         "lang_en": "🇬🇧 English",
         "lang_ru": "🇷🇺 Russian",
+        "tab_alerts": "  🔔  Alerts  ",
     },
     "ru": {
         "app_title": "Twitch Overlay",
@@ -233,6 +248,7 @@ TRANSLATIONS = {
         "ov_conn_error": "✗ Ошибка подключения: {e}",
         "lang_en": "🇬🇧 English",
         "lang_ru": "🇷🇺 Русский",
+        "tab_alerts": "  🔔  Алерты  ",
     },
 }
 
@@ -348,6 +364,80 @@ stats = {
 
 _translate_cache = {}
 _translate_lock = threading.Lock()
+
+
+def load_alerts_config():
+    global _alerts_config
+    try:
+        if os.path.exists(ALERTS_CONFIG_FILE):
+            with open(ALERTS_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                _alerts_config = data
+                return data
+    except Exception:
+        pass
+    _alerts_config = DEFAULT_ALERTS_CONFIG.copy()
+    return _alerts_config.copy()
+
+
+def save_alerts_config(cfg):
+    global _alerts_config
+    _alerts_config = cfg
+    try:
+        with open(ALERTS_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def check_message_for_alerts(message: str) -> dict | None:
+    """
+    Checks if message contains any alert keyword.
+    Returns matching alert config dict or None.
+    Respects per-alert cooldown.
+    """
+    if not _alerts_config.get('enabled', True):
+        return None
+    msg_lower = message.lower()
+    cooldown  = _alerts_config.get('cooldown', 10)
+    now       = time.time()
+    for alert in _alerts_config.get('alerts', []):
+        for kw in alert.get('keywords', []):
+            if kw.lower() in msg_lower:
+                last = _alert_last_fired.get(kw.lower(), 0)
+                if now - last >= cooldown:
+                    with _alert_lock:
+                        _alert_last_fired[kw.lower()] = now
+                    return alert
+    return None
+
+
+def fetch_alert_image(url: str) -> bytes | None:
+    if not url:
+        return None
+    with _alert_lock:
+        if url in _alert_image_cache:
+            return _alert_image_cache[url]
+
+    data = None
+
+    if os.path.isfile(url):
+        try:
+            with open(url, 'rb') as f:
+                data = f.read(15 * 1024 * 1024)
+        except Exception as e:
+            log_to_gui(f"Error reading local alert file: {e}", "ERROR")
+    elif url.startswith('http://') or url.startswith('https://'):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'TwitchOverlay/1.0'})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = resp.read(15 * 1024 * 1024)
+        except Exception as e:
+            log_to_gui(f"Error downloading alert image: {e}", "ERROR")
+
+    with _alert_lock:
+        _alert_image_cache[url] = data
+    return data
 
 
 def _is_mostly_english(text: str) -> bool:
@@ -1266,9 +1356,12 @@ class GhostOverlay:
         if msg_color is None:
             msg_color = self.cfg.get('text_color', '#FFFFFF')
 
-        has_emotes = bool(emotes_raw)
+        alert = check_message_for_alerts(message)
+        if alert:
+            self.root.after(0, lambda a=alert: self.trigger_alert(a))
 
-        result = process_message_pipeline(username, message, has_emotes=has_emotes)
+        has_emotes        = bool(emotes_raw)
+        result            = process_message_pipeline(username, message, has_emotes=has_emotes)
         processed_msg    = result['message']
         command_response = result['command_response']
         censored_ranges  = result['censored_ranges']
@@ -1296,6 +1389,208 @@ class GhostOverlay:
     def clear(self):
         with self._queue_lock:
             self._message_queue.append(('_clear',))
+
+    def trigger_alert(self, alert_cfg: dict):
+        if not PIL_OK:
+            return
+
+        duration = alert_cfg.get('duration', 4000)
+        label    = alert_cfg.get('label', '🔥')
+        url      = alert_cfg.get('image_url', '')
+
+        def _do_alert(image_data):
+            if not self.running:
+                return
+
+            w         = self.cfg['width']
+            h         = self.cfg['height']
+            pad       = self.padding
+            items     = []
+
+            alert_photo   = [None]
+            anim_frames   = [None]
+            anim_delays   = [None]
+            img_w, img_h  = 0, 0
+
+            if image_data:
+                try:
+                    from PIL import ImageTk
+                    img_io  = io.BytesIO(image_data)
+                    pil_img = Image.open(img_io)
+
+                    max_img_w = int(w * 0.9)
+                    max_img_h = int(h * 0.55)
+                    ow, oh    = pil_img.size if hasattr(pil_img, 'size') else (100, 100)
+                    scale     = min(max_img_w / max(ow, 1), max_img_h / max(oh, 1), 1.0)
+                    target    = (max(1, int(ow * scale)), max(1, int(oh * scale)))
+                    img_w, img_h = target
+
+                    is_anim  = getattr(pil_img, 'is_animated', False)
+                    n_frames = getattr(pil_img, 'n_frames', 1)
+
+                    if is_anim and n_frames > 1:
+                        frames, delays = [], []
+                        for i in range(n_frames):
+                            pil_img.seek(i)
+                            f = pil_img.copy().convert('RGBA').resize(target, Image.LANCZOS)
+                            frames.append(ImageTk.PhotoImage(f, master=self.root))
+                            d = pil_img.info.get('duration', 80)
+                            delays.append(max(20, d))
+                        anim_frames[0] = frames
+                        anim_delays[0] = delays
+                        alert_photo[0] = frames[0]
+                    else:
+                        f = pil_img.convert('RGBA').resize(target, Image.LANCZOS)
+                        alert_photo[0] = ImageTk.PhotoImage(f, master=self.root)
+
+                    self._active_alert_img_ref = alert_photo[0]
+                    self._active_alert_frames_ref = anim_frames[0]
+
+                except Exception as e:
+                    log_to_gui(f"Alert image processing error: {e}", "WARN")
+
+            label_font  = tkfont.Font(family='Segoe UI', size=16, weight='bold')
+            label_h     = 28
+            img_block_h = img_h + 8 if img_h else 0
+            block_h     = label_h + img_block_h + pad * 2
+
+            canvas_h = self.canvas.winfo_height()
+            if canvas_h < 10:
+                canvas_h = h
+
+            start_y  = canvas_h
+            target_y = canvas_h - block_h - pad
+            cx       = w // 2
+
+            bg_item = self.canvas.create_rectangle(
+                pad, start_y,
+                w - pad, start_y + block_h,
+                fill='#111111', outline='#9146FF', width=2,
+                tags='alert'
+            )
+            items.append(bg_item)
+
+            lbl_shadow = self.canvas.create_text(
+                cx + 1, start_y + label_h // 2 + 1,
+                text=label, font=label_font,
+                fill='#000000', anchor='center', tags='alert'
+            )
+            lbl_main = self.canvas.create_text(
+                cx, start_y + label_h // 2,
+                text=label, font=label_font,
+                fill='#FFD700', anchor='center', tags='alert'
+            )
+            items += [lbl_shadow, lbl_main]
+
+            img_item = None
+            if alert_photo[0]:
+                img_y    = start_y + label_h + img_h // 2 + 4
+                img_item = self.canvas.create_image(
+                    cx, img_y, image=alert_photo[0],
+                    anchor='center', tags='alert'
+                )
+                items.append(img_item)
+
+            anim_state = {'idx': 0, 'job': None, 'running': True}
+            if anim_frames[0] and img_item:
+                def _next_anim_frame():
+                    if not self.running or not anim_state['running']:
+                        return
+                    anim_state['idx'] = (anim_state['idx'] + 1) % len(anim_frames[0])
+                    try:
+                        self.canvas.itemconfig(img_item, image=anim_frames[0][anim_state['idx']])
+                    except Exception:
+                        return
+                    anim_state['job'] = self.root.after(
+                        anim_delays[0][anim_state['idx']], _next_anim_frame
+                    )
+                anim_state['job'] = self.root.after(anim_delays[0][0], _next_anim_frame)
+
+            border_colors = ['#9146FF', '#FF4488', '#FF8800', '#FFFF00',
+                             '#00FF88', '#00AAFF', '#9146FF']
+            pulse_state   = {'phase': 0, 'job': None}
+
+            def _pulse():
+                if not self.running:
+                    return
+                pulse_state['phase'] = (pulse_state['phase'] + 1) % len(border_colors)
+                try:
+                    self.canvas.itemconfig(
+                        bg_item, outline=border_colors[pulse_state['phase']]
+                    )
+                except Exception:
+                    return
+                pulse_state['job'] = self.root.after(150, _pulse)
+
+            pulse_state['job'] = self.root.after(150, _pulse)
+
+            for item in items:
+                try:
+                    self.canvas.tag_raise(item)
+                except Exception:
+                    pass
+
+            # Slide-in анимация
+            SLIDE_STEPS = 12
+            SLIDE_MS    = 18
+            dy          = (target_y - start_y) / SLIDE_STEPS
+            step_state  = {'step': 0}
+
+            def _slide_in():
+                if not self.running:
+                    return
+                step_state['step'] += 1
+                self.canvas.move('alert', 0, dy)
+                if step_state['step'] < SLIDE_STEPS:
+                    self.root.after(SLIDE_MS, _slide_in)
+
+            self.root.after(SLIDE_MS, _slide_in)
+
+            def _start_slide_out():
+                if not self.running:
+                    return
+                anim_state['running'] = False
+                if pulse_state['job']:
+                    try:
+                        self.root.after_cancel(pulse_state['job'])
+                    except Exception:
+                        pass
+
+                out_step  = [0]
+                out_total = SLIDE_STEPS
+                out_dy    = (start_y - target_y) / out_total
+
+                def _slide_out():
+                    if not self.running:
+                        self.canvas.delete('alert')
+                        return
+                    out_step[0] += 1
+                    self.canvas.move('alert', 0, out_dy)
+                    if out_step[0] < out_total:
+                        self.root.after(SLIDE_MS, _slide_out)
+                    else:
+                        self.canvas.delete('alert')
+                        self._active_alert_img_ref = None
+                        self._active_alert_frames_ref = None
+                        
+                        if self.settings_mode:
+                            for sid in self.settings_border_ids:
+                                try:
+                                    self.canvas.tag_raise(sid)
+                                except Exception:
+                                    pass
+
+                self.root.after(SLIDE_MS, _slide_out)
+
+            self.root.after(duration, _start_slide_out)
+
+        def _fetch_and_show():
+            data = fetch_alert_image(url) if url else None
+            if url and not data:
+                log_to_gui(f"Alert image load failed for: {url}", "WARN")
+            self.root.after(0, lambda: _do_alert(data))
+
+        threading.Thread(target=_fetch_and_show, daemon=True, name="AlertFetch").start()
 
     def _process_queue(self):
         if not self.running:
@@ -1864,6 +2159,7 @@ class ControlPanel:
             ("tab_logs",       self._build_log_tab),
             ("tab_settings",   self._build_settings_tab),
             ("tab_stats",      self._build_stats_tab),
+            ("tab_alerts",     self._build_alerts_tab),
         ]:
             frame = tk.Frame(self._notebook, bg='#1e1e1e')
             self._notebook.add(frame, text=t(tab_key))
@@ -2277,6 +2573,210 @@ class ControlPanel:
         except Exception:
             pass
         self.window = None
+
+    def _build_alerts_tab(self, parent):
+        outer = tk.Frame(parent, bg='#1e1e1e', padx=20, pady=16)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(outer, text="🔔  Keyword Alerts",
+                 font=('Segoe UI', 14, 'bold'), bg='#1e1e1e', fg='#9146FF').pack(anchor='w', pady=(0, 4))
+        tk.Label(outer,
+                 text="When a keyword appears in chat, an image pops up on the overlay.",
+                 font=('Segoe UI', 9), bg='#1e1e1e', fg='#888888').pack(anchor='w', pady=(0, 14))
+
+        glob_frame = tk.Frame(outer, bg='#252525', padx=12, pady=10)
+        glob_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self._alerts_enabled_var = tk.BooleanVar(value=_alerts_config.get('enabled', True))
+        tk.Checkbutton(glob_frame, text="Enable alerts", variable=self._alerts_enabled_var,
+                       bg='#252525', fg='white', selectcolor='#9146FF',
+                       activebackground='#252525', activeforeground='white',
+                       font=('Segoe UI', 10),
+                       command=self._save_alerts_global).pack(side=tk.LEFT)
+
+        tk.Label(glob_frame, text="Cooldown (sec):", bg='#252525', fg='#aaaaaa',
+                 font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(20, 4))
+        self._cooldown_var = tk.StringVar(value=str(_alerts_config.get('cooldown', 10)))
+        cooldown_entry = tk.Entry(glob_frame, textvariable=self._cooldown_var, width=5,
+                                  bg='#0d0d0d', fg='white', insertbackground='white',
+                                  relief='flat', font=('Consolas', 10))
+        cooldown_entry.pack(side=tk.LEFT)
+        cooldown_entry.bind('<Return>', lambda e: self._save_alerts_global())
+        cooldown_entry.bind('<FocusOut>', lambda e: self._save_alerts_global())
+
+        list_frame = tk.Frame(outer, bg='#1e1e1e')
+        list_frame.pack(fill=tk.BOTH, expand=True)
+
+        list_scroll = tk.Scrollbar(list_frame)
+        list_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._alerts_listbox = tk.Listbox(list_frame,
+            bg='#0d0d0d', fg='#d0d0d0', selectbackground='#9146FF',
+            font=('Consolas', 10), relief='flat', bd=0,
+            yscrollcommand=list_scroll.set, height=8)
+        self._alerts_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        list_scroll.config(command=self._alerts_listbox.yview)
+        self._alerts_listbox.bind('<<ListboxSelect>>', self._on_alert_select)
+
+        editor = tk.Frame(outer, bg='#252525', padx=14, pady=12)
+        editor.pack(fill=tk.X, pady=(10, 0))
+
+        def lbl(row, col, text):
+            tk.Label(row, text=text, bg='#252525', fg='#aaaaaa',
+                     font=('Segoe UI', 9), width=14, anchor='w').pack(side=tk.LEFT)
+
+        kw_row = tk.Frame(editor, bg='#252525')
+        kw_row.pack(fill=tk.X, pady=3)
+        lbl(kw_row, 0, "Keywords:")
+        self._alert_kw_var = tk.StringVar()
+        tk.Entry(kw_row, textvariable=self._alert_kw_var, bg='#0d0d0d', fg='white',
+                 insertbackground='white', relief='flat', font=('Consolas', 10)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(kw_row, text=" (comma separated)", bg='#252525', fg='#666666',
+                 font=('Segoe UI', 8)).pack(side=tk.LEFT)
+
+        url_row = tk.Frame(editor, bg='#252525')
+        url_row.pack(fill=tk.X, pady=3)
+        lbl(url_row, 0, "Image file:")
+        self._alert_url_var = tk.StringVar()
+        tk.Entry(url_row, textvariable=self._alert_url_var, bg='#0d0d0d', fg='white',
+                 insertbackground='white', relief='flat', font=('Consolas', 10)).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Button(url_row, text="📂 Browse", command=self._browse_alert_image,
+                  bg='#3a3a3a', fg='white', font=('Segoe UI', 9),
+                  relief='flat', padx=10, pady=3, cursor='hand2').pack(side=tk.LEFT)
+
+        meta_row = tk.Frame(editor, bg='#252525')
+        meta_row.pack(fill=tk.X, pady=3)
+        lbl(meta_row, 0, "Label:")
+        self._alert_label_var = tk.StringVar(value="🔥")
+        tk.Entry(meta_row, textvariable=self._alert_label_var, width=12,
+                 bg='#0d0d0d', fg='white', insertbackground='white',
+                 relief='flat', font=('Consolas', 10)).pack(side=tk.LEFT, padx=(0, 20))
+        tk.Label(meta_row, text="Duration (ms):", bg='#252525', fg='#aaaaaa',
+                 font=('Segoe UI', 9)).pack(side=tk.LEFT)
+        self._alert_dur_var = tk.StringVar(value="4000")
+        tk.Entry(meta_row, textvariable=self._alert_dur_var, width=7,
+                 bg='#0d0d0d', fg='white', insertbackground='white',
+                 relief='flat', font=('Consolas', 10)).pack(side=tk.LEFT)
+
+        btn_row = tk.Frame(editor, bg='#252525')
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        tk.Button(btn_row, text="➕ Add / Update", command=self._alert_add_or_update,
+                  bg='#2d5a27', fg='white', font=('Segoe UI', 10, 'bold'),
+                  relief='flat', padx=14, pady=7, cursor='hand2').pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(btn_row, text="🗑 Delete selected", command=self._alert_delete,
+                  bg='#6a1a1a', fg='white', font=('Segoe UI', 10),
+                  relief='flat', padx=14, pady=7, cursor='hand2').pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(btn_row, text="▶ Test alert", command=self._alert_test,
+                  bg='#1a3a6a', fg='white', font=('Segoe UI', 10),
+                  relief='flat', padx=14, pady=7, cursor='hand2').pack(side=tk.LEFT)
+
+        self._refresh_alerts_list()
+
+    def _refresh_alerts_list(self):
+        if not hasattr(self, '_alerts_listbox'):
+            return
+        self._alerts_listbox.delete(0, tk.END)
+        for alert in _alerts_config.get('alerts', []):
+            kws  = ', '.join(alert.get('keywords', []))
+            lbl  = alert.get('label', '')
+            dur  = alert.get('duration', 4000)
+            self._alerts_listbox.insert(tk.END, f"{lbl}  [{kws}]  {dur}ms")
+
+    def _on_alert_select(self, event=None):
+        sel = self._alerts_listbox.curselection()
+        if not sel:
+            return
+        idx   = sel[0]
+        alert = _alerts_config.get('alerts', [])[idx]
+        self._alert_kw_var.set(', '.join(alert.get('keywords', [])))
+        self._alert_url_var.set(alert.get('image_url', ''))
+        self._alert_label_var.set(alert.get('label', '🔥'))
+        self._alert_dur_var.set(str(alert.get('duration', 4000)))
+
+    def _alert_add_or_update(self):
+        kws_raw = self._alert_kw_var.get().strip()
+        url     = self._alert_url_var.get().strip()
+        label   = self._alert_label_var.get().strip() or '🔥'
+        try:
+            duration = int(self._alert_dur_var.get().strip())
+            duration = max(500, min(30000, duration))
+        except:
+            duration = 4000
+
+        if not kws_raw:
+            return
+
+        keywords = [k.strip() for k in kws_raw.split(',') if k.strip()]
+        new_alert = {'keywords': keywords, 'image_url': url, 'label': label, 'duration': duration}
+
+        global _alerts_config
+        cfg = _alerts_config.copy()
+        alerts = cfg.get('alerts', [])
+        
+        sel = self._alerts_listbox.curselection()
+        if sel:
+            alerts[sel[0]] = new_alert
+        else:
+            alerts.append(new_alert)
+
+        cfg['alerts'] = alerts
+        save_alerts_config(cfg)
+        self._refresh_alerts_list()
+        
+        self._alert_kw_var.set("")
+        self._alert_url_var.set("")
+        log_to_gui(f"Alert saved: {keywords}", "OK")
+
+    def _alert_delete(self):
+        sel = self._alerts_listbox.curselection()
+        if not sel:
+            return
+        
+        global _alerts_config
+        cfg = _alerts_config.copy()
+        alerts = cfg.get('alerts', [])
+        
+        idx = sel[0]
+        del alerts[idx]
+        
+        cfg['alerts'] = alerts
+        save_alerts_config(cfg)
+        self._refresh_alerts_list()
+        log_to_gui("Alert deleted", "INFO")
+
+    def _save_alerts_global(self):
+        cfg = _alerts_config.copy()
+        cfg['enabled'] = self._alerts_enabled_var.get()
+        try:
+            cfg['cooldown'] = max(0, int(self._cooldown_var.get()))
+        except Exception:
+            pass
+        save_alerts_config(cfg)
+
+    def _alert_test(self):
+        url   = self._alert_url_var.get().strip()
+        label = self._alert_label_var.get().strip() or '🔥'
+        try:
+            duration = int(self._alert_dur_var.get().strip())
+        except Exception:
+            duration = 4000
+        test_alert = {'image_url': url, 'label': label, 'duration': duration, 'keywords': []}
+        self.overlay.trigger_alert(test_alert)
+        log_to_gui(f"Alert test fired: {label}", "INFO")
+
+    def _browse_alert_image(self):
+        filepath = filedialog.askopenfilename(
+            title="Select alert image",
+            filetypes=[
+                ("Images", "*.png *.jpg *.jpeg *.gif *.webp *.bmp"),
+                ("GIF animations", "*.gif"),
+                ("All files", "*.*"),
+            ]
+        )
+        if filepath:
+            self._alert_url_var.set(filepath)
 
 
 class TrayManager:
@@ -2883,6 +3383,7 @@ def main():
     if args.test:
         twitch_config["test_mode"] = True
 
+    load_alerts_config()
     initial_state = load_app_state()
     set_language(initial_state.get('language', 'en'))
 
