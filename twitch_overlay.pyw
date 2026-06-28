@@ -8,11 +8,13 @@ import json
 import argparse
 import threading
 import queue
+import sys
 from datetime import datetime
 from collections import defaultdict
 import tkinter as tk
 from tkinter import ttk, font as tkfont
 import ctypes
+from ctypes import wintypes
 
 try:
     import win32gui
@@ -33,27 +35,22 @@ try:
 except ImportError:
     PIL_OK = False
 
+HEARTBEAT_FILE     = "heartbeat.tmp"
+HEARTBEAT_INTERVAL = 5
 
 OVERLAY_CONFIG_FILE = "overlay_config.json"
-APP_STATE_FILE = "app_state.json"
+APP_STATE_FILE      = "app_state.json"
 
 DEFAULT_OVERLAY_CONFIG = {
-    "x": 50,
-    "y": 50,
-    "width": 550,
-    "height": 450,
-    "opacity": 0.78,
-    "font_size": 13,
-    "font_family": "Consolas",
-    "text_color": "#FFFFFF",
-    "max_messages": 80,
+    "x": 50, "y": 50, "width": 550, "height": 450,
+    "opacity": 0.78, "font_size": 13, "font_family": "Consolas",
+    "text_color": "#FFFFFF", "max_messages": 80,
 }
 
 DEFAULT_APP_STATE = {
     "last_channel": "",
     "language": "en",
 }
-
 
 TRANSLATIONS = {
     "en": {
@@ -76,6 +73,7 @@ TRANSLATIONS = {
             "• To change channel — disconnect and connect to a new one\n"
             "• Overlay shows over any window (including borderless games)\n"
             "• Mouse clicks pass through the overlay — it won't block your game\n"
+            "• F8 = full restart (supervisor hotkey)\n"
             "• Anonymous nick: "
         ),
         "log_title": "📜  System messages and chat",
@@ -158,6 +156,7 @@ TRANSLATIONS = {
             "• Чтобы сменить канал — отключитесь и подключитесь к новому\n"
             "• Overlay появится поверх любого окна (включая игры в borderless)\n"
             "• Сквозь overlay проходят клики мыши — он не мешает играть\n"
+            "• F8 = полный перезапуск (хоткей супервизора)\n"
             "• Анонимный ник: "
         ),
         "log_title": "📜  Системные сообщения и чат",
@@ -222,7 +221,6 @@ TRANSLATIONS = {
     },
 }
 
-
 _current_lang = "en"
 
 
@@ -232,7 +230,7 @@ def t(key, **kwargs):
     if kwargs:
         try:
             return s.format(**kwargs)
-        except:
+        except Exception:
             return s
     return s
 
@@ -252,7 +250,7 @@ def load_overlay_config():
                     if k not in cfg:
                         cfg[k] = v
                 return cfg
-    except:
+    except Exception:
         pass
     return DEFAULT_OVERLAY_CONFIG.copy()
 
@@ -261,7 +259,7 @@ def save_overlay_config(cfg):
     try:
         with open(OVERLAY_CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except:
+    except Exception:
         pass
 
 
@@ -274,7 +272,7 @@ def load_app_state():
                     if k not in state:
                         state[k] = v
                 return state
-    except:
+    except Exception:
         pass
     return DEFAULT_APP_STATE.copy()
 
@@ -283,15 +281,14 @@ def save_app_state(state):
     try:
         with open(APP_STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
-    except:
+    except Exception:
         pass
 
 
 TWITCH_HOST = "irc.chat.twitch.tv"
 TWITCH_PORT = 6667
-ANON_NICK = "justinfan" + str(random.randint(10000, 99999))
-
-LOGS_DIR = "chat_logs"
+ANON_NICK   = "justinfan" + str(random.randint(10000, 99999))
+LOGS_DIR    = "chat_logs"
 
 DEFAULT_COLORS = [
     "#FF6699", "#00FFAA", "#FFAA00", "#66CCFF",
@@ -301,66 +298,56 @@ DEFAULT_COLORS = [
 
 HASH_SALT = os.urandom(16).hex()
 
-
 twitch_config = {
-    "channel": None,
-    "test_mode": False,
-    "log_system": True,
-    "log_stats": True,
-    "max_reconnects": 50,
+    "channel": None, "test_mode": False,
+    "log_system": True, "log_stats": True, "max_reconnects": 50,
 }
 
 connection_state = {
-    "connected": False,
-    "connecting": False,
-    "current_channel": None,
-    "sock": None,
+    "connected": False, "connecting": False,
+    "current_channel": None, "sock": None,
+    "last_activity": time.time(),
 }
 connection_lock = threading.Lock()
 
-chat_command = queue.Queue()
-
-user_colors = {}
+chat_command  = queue.Queue()
+user_colors   = {}
 system_log_file = None
-should_stop = threading.Event()
-
-log_queue = queue.Queue()
+should_stop   = threading.Event()
+log_queue     = queue.Queue()
 
 stats = {
-    "session_start": time.time(),
+    "session_start":     time.time(),
     "session_start_iso": datetime.now().isoformat(),
-    "channel": None,
-    "total_messages": 0,
+    "channel":           None,
+    "total_messages":    0,
     "unique_users_hashed": set(),
     "messages_per_minute": defaultdict(int),
     "users_by_role": {
         "moderators": set(), "subscribers": set(),
         "vips": set(), "broadcaster": set(),
     },
-    "errors": 0,
-    "reconnects": 0,
-    "irc_pings": 0,
+    "errors": 0, "reconnects": 0, "irc_pings": 0,
 }
 
 
 class GhostOverlay:
     def __init__(self, overlay_cfg):
-        self.cfg = overlay_cfg
-        self.root = tk.Tk()
-        self.root.title("Twitch Ghost Overlay")
-        self.running = True
-        self.visible = True
-        self.settings_mode = False
+        self.cfg            = overlay_cfg
+        self.root           = tk.Tk()
+        self.running        = True
+        self.visible        = True
+        self.settings_mode  = False
         self._message_queue = []
-        self._queue_lock = threading.Lock()
+        self._queue_lock    = threading.Lock()
         self.message_blocks = []
 
+        self.root.title("Twitch Ghost Overlay")
         self.root.overrideredirect(True)
         self.root.attributes('-topmost', True)
         self.root.attributes('-alpha', self.cfg['opacity'])
         self.root.configure(bg='black')
         self.root.attributes('-transparentcolor', 'black')
-
         self._apply_geometry()
 
         self.canvas = tk.Canvas(self.root, bg='black', highlightthickness=0, bd=0)
@@ -368,32 +355,28 @@ class GhostOverlay:
 
         self.text_font = tkfont.Font(
             family=self.cfg['font_family'],
-            size=self.cfg['font_size'],
-            weight='normal'
+            size=self.cfg['font_size'], weight='normal'
         )
         self.name_font = tkfont.Font(
             family=self.cfg['font_family'],
-            size=max(9, self.cfg['font_size'] - 2),
-            weight='bold'
+            size=max(9, self.cfg['font_size'] - 2), weight='bold'
         )
 
-        self.padding = 12
-        self.line_spacing = self.cfg['font_size'] + 8
+        self.padding          = 12
+        self.line_spacing     = self.cfg['font_size'] + 8
         self.name_line_height = max(9, self.cfg['font_size'] - 2) + 8
         self.msg_block_spacing = 10
-        self.name_to_msg_gap = 3
-
+        self.name_to_msg_gap  = 3
         self.settings_border_ids = []
 
-        self.root.after(50, self._make_click_through)
+        self.root.after(50,  self._make_click_through)
+        self.root.after(200, self._make_click_through)
         self.root.after(500, self._keep_topmost_loop)
-        self.root.after(33, self._process_queue)
+        self.root.after(33,  self._process_queue)
 
     def _apply_geometry(self):
-        w = self.cfg['width']
-        h = self.cfg['height']
-        x = self.cfg['x']
-        y = self.cfg['y']
+        w, h = self.cfg['width'], self.cfg['height']
+        x, y = self.cfg['x'],     self.cfg['y']
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
     def _get_hwnd(self):
@@ -403,19 +386,19 @@ class GhostOverlay:
         if not WIN32_OK:
             return
         try:
-            hwnd = self._get_hwnd()
+            hwnd     = self._get_hwnd()
             ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            new_style = (
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE,
                 ex_style
                 | win32con.WS_EX_LAYERED
                 | win32con.WS_EX_TRANSPARENT
                 | win32con.WS_EX_TOOLWINDOW
+                | win32con.WS_EX_NOACTIVATE
             )
-            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_style)
             win32gui.SetWindowPos(
-                hwnd, win32con.HWND_TOPMOST,
-                0, 0, 0, 0,
-                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+                hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE
+                | win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
             )
         except Exception as e:
             log_to_gui(f"Click-through error: {e}", "ERROR")
@@ -425,13 +408,17 @@ class GhostOverlay:
             return
         if WIN32_OK:
             try:
-                hwnd = self._get_hwnd()
+                hwnd     = self._get_hwnd()
+                ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+                need = (win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT
+                        | win32con.WS_EX_TOOLWINDOW | win32con.WS_EX_NOACTIVATE)
+                if (ex_style & need) != need:
+                    win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style | need)
                 win32gui.SetWindowPos(
-                    hwnd, win32con.HWND_TOPMOST,
-                    0, 0, 0, 0,
+                    hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
                     win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
                 )
-            except:
+            except Exception:
                 pass
         self.root.after(1000, self._keep_topmost_loop)
 
@@ -443,65 +430,53 @@ class GhostOverlay:
         for item_id in self.settings_border_ids:
             try:
                 self.canvas.delete(item_id)
-            except:
+            except Exception:
                 pass
         self.settings_border_ids = []
-
         if not self.settings_mode:
             return
 
-        w = self.cfg['width']
-        h = self.cfg['height']
+        w, h = self.cfg['width'], self.cfg['height']
+        ids  = []
+        ids.append(self.canvas.create_rectangle(1, 1, w-1, h-1,
+            outline='#FF3366', width=2, tags='settings_border'))
+        ids.append(self.canvas.create_rectangle(4, 4, w-4, h-4,
+            outline='#FFAA00', width=1, tags='settings_border'))
 
-        outer = self.canvas.create_rectangle(1, 1, w - 1, h - 1, outline='#FF3366', width=2, tags='settings_border')
-        inner = self.canvas.create_rectangle(4, 4, w - 4, h - 4, outline='#FFAA00', width=1, tags='settings_border')
+        cs, cc, cw = 18, '#00FFFF', 3
+        for line_coords in [
+            (0,0,cs,0),(0,0,0,cs),(w,0,w-cs,0),(w,0,w,cs),
+            (0,h,cs,h),(0,h,0,h-cs),(w,h,w-cs,h),(w,h,w,h-cs),
+        ]:
+            ids.append(self.canvas.create_line(*line_coords,
+                fill=cc, width=cw, tags='settings_border'))
 
-        corner_size = 18
-        cc = '#00FFFF'
-        cw = 3
-        corners = [
-            self.canvas.create_line(0, 0, corner_size, 0, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(0, 0, 0, corner_size, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(w, 0, w - corner_size, 0, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(w, 0, w, corner_size, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(0, h, corner_size, h, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(0, h, 0, h - corner_size, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(w, h, w - corner_size, h, fill=cc, width=cw, tags='settings_border'),
-            self.canvas.create_line(w, h, w, h - corner_size, fill=cc, width=cw, tags='settings_border'),
-        ]
-
-        size_label = self.canvas.create_text(
-            w // 2, h - 14,
+        ids.append(self.canvas.create_text(
+            w//2, h-14,
             text=f"  {w} × {h}  @  ({self.cfg['x']}, {self.cfg['y']})  ",
-            font=('Segoe UI', 9, 'bold'),
-            fill='#FFFF00', tags='settings_border'
-        )
-
-        self.settings_border_ids = [outer, inner] + corners + [size_label]
-        for item_id in self.settings_border_ids:
+            font=('Segoe UI', 9, 'bold'), fill='#FFFF00', tags='settings_border'
+        ))
+        self.settings_border_ids = ids
+        for item_id in ids:
             try:
                 self.canvas.tag_raise(item_id)
-            except:
+            except Exception:
                 pass
 
     def _wrap_to_lines(self, text, max_width, font):
         text = re.sub(r'\s+', ' ', text).strip()
         if not text:
             return [""]
-
-        words = text.split(' ')
-        lines = []
+        words        = text.split(' ')
+        lines        = []
         current_line = ""
-
         i = 0
         while i < len(words):
             word = words[i]
-
             if font.measure(word) > max_width:
                 if current_line:
                     lines.append(current_line)
                     current_line = ""
-
                 chunk = ""
                 for ch in word:
                     test = chunk + ch
@@ -515,7 +490,6 @@ class GhostOverlay:
                     current_line = chunk
                 i += 1
                 continue
-
             test_line = current_line + " " + word if current_line else word
             if font.measure(test_line) <= max_width:
                 current_line = test_line
@@ -524,7 +498,6 @@ class GhostOverlay:
                     lines.append(current_line)
                 current_line = word
             i += 1
-
         if current_line:
             lines.append(current_line)
         return lines if lines else [""]
@@ -533,46 +506,38 @@ class GhostOverlay:
         canvas_h = self.canvas.winfo_height()
         if canvas_h < 10:
             canvas_h = self.cfg['height']
-
-        bottom_limit = canvas_h - self.padding
+        bottom_limit   = canvas_h - self.padding
         current_bottom = self._get_current_bottom()
-
         if current_bottom + needed_height <= bottom_limit:
             return
-
-        deficit = (current_bottom + needed_height) - bottom_limit
-
-        removed_height = 0
+        deficit          = (current_bottom + needed_height) - bottom_limit
+        removed_height   = 0
         blocks_to_remove = []
         for block in self.message_blocks:
             if removed_height >= deficit:
                 break
             blocks_to_remove.append(block)
             removed_height += block['height']
-
         for block in blocks_to_remove:
             for item_id in block['items']:
                 try:
                     self.canvas.delete(item_id)
-                except:
+                except Exception:
                     pass
-
         self.message_blocks = self.message_blocks[len(blocks_to_remove):]
-
         if removed_height > 0:
             self.canvas.move('msg', 0, -removed_height)
             for block in self.message_blocks:
                 block['start_y'] -= removed_height
-
         max_msg = self.cfg.get('max_messages', 80)
         if len(self.message_blocks) > max_msg:
-            extra = self.message_blocks[:len(self.message_blocks) - max_msg]
+            extra   = self.message_blocks[:len(self.message_blocks) - max_msg]
             extra_h = sum(b['height'] for b in extra)
             for block in extra:
                 for item_id in block['items']:
                     try:
                         self.canvas.delete(item_id)
-                    except:
+                    except Exception:
                         pass
             self.message_blocks = self.message_blocks[len(extra):]
             if extra_h > 0:
@@ -587,10 +552,9 @@ class GhostOverlay:
         return last['start_y'] + last['height']
 
     def _draw_outlined_text(self, x, y, text, font, color, items_collector):
-        for ox, oy in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        for ox, oy in [(-1,-1),(-1,1),(1,-1),(1,1)]:
             tid = self.canvas.create_text(
-                x + ox, y + oy,
-                text=text, font=font,
+                x+ox, y+oy, text=text, font=font,
                 fill='#000000', anchor='nw', tags='msg'
             )
             items_collector.append(tid)
@@ -603,20 +567,16 @@ class GhostOverlay:
 
     def _draw_name_header(self, x, y, badge_icon, username, name_color, items_collector):
         cur_x = x
-
         if badge_icon:
             icon_id = self.canvas.create_text(
-                cur_x, y,
-                text=badge_icon, font=self.name_font,
+                cur_x, y, text=badge_icon, font=self.name_font,
                 fill='#FFCC44', anchor='nw', tags='msg'
             )
             items_collector.append(icon_id)
-            icon_w = self.name_font.measure(badge_icon)
-            cur_x += icon_w + 6
+            cur_x += self.name_font.measure(badge_icon) + 6
 
         name_w = self.name_font.measure(username)
-        pad_x = 7
-        pad_y = 2
+        pad_x, pad_y = 7, 2
         font_h = self.name_font.metrics('linespace')
         pill_h = font_h + pad_y * 2
 
@@ -624,32 +584,28 @@ class GhostOverlay:
             r = int(name_color[1:3], 16)
             g = int(name_color[3:5], 16)
             b = int(name_color[5:7], 16)
-            luminance = (0.299 * r + 0.587 * g + 0.114 * b)
-            text_on_pill = '#FFFFFF' if luminance < 140 else '#1A1A1A'
-        except:
+            text_on_pill = '#FFFFFF' if (0.299*r + 0.587*g + 0.114*b) < 140 else '#1A1A1A'
+        except Exception:
             text_on_pill = '#FFFFFF'
 
-        rect_id = self.canvas.create_rectangle(
-            cur_x, y,
-            cur_x + name_w + pad_x * 2, y + pill_h,
+        items_collector.append(self.canvas.create_rectangle(
+            cur_x, y, cur_x + name_w + pad_x*2, y + pill_h,
             fill=name_color, outline=name_color, tags='msg'
-        )
-        items_collector.append(rect_id)
-
-        name_id = self.canvas.create_text(
-            cur_x + pad_x, y + pad_y,
-            text=username, font=self.name_font,
+        ))
+        items_collector.append(self.canvas.create_text(
+            cur_x + pad_x, y + pad_y, text=username, font=self.name_font,
             fill=text_on_pill, anchor='nw', tags='msg'
-        )
-        items_collector.append(name_id)
+        ))
+        return pill_h, cur_x + name_w + pad_x*2
 
-        return pill_h, cur_x + name_w + pad_x * 2
-
-    def add_chat_message(self, username, message, name_color='#9146FF', msg_color=None, badge=None):
+    def add_chat_message(self, username, message,
+                         name_color='#9146FF', msg_color=None, badge=None):
         if msg_color is None:
             msg_color = self.cfg.get('text_color', '#FFFFFF')
         with self._queue_lock:
-            self._message_queue.append(('chat', username, message, name_color, msg_color, badge))
+            self._message_queue.append(
+                ('chat', username, message, name_color, msg_color, badge)
+            )
 
     def add_system_message(self, message, color='#AAAAAA'):
         with self._queue_lock:
@@ -662,18 +618,14 @@ class GhostOverlay:
     def _process_queue(self):
         if not self.running:
             return
-
         with self._queue_lock:
             messages = self._message_queue[:]
             self._message_queue.clear()
-
-        batch = messages[:4]
+        batch     = messages[:4]
         remaining = messages[4:]
-
         if remaining:
             with self._queue_lock:
                 self._message_queue = remaining + self._message_queue
-
         for msg in batch:
             try:
                 if msg[0] == '_clear':
@@ -682,96 +634,68 @@ class GhostOverlay:
                     self._render_message(msg)
             except Exception as e:
                 log_to_gui(f"Overlay render error: {e}", "ERROR")
-
         if self.settings_mode and not self.settings_border_ids:
             self._redraw_settings_border()
-
-        delay = 20 if remaining else 40
-        self.root.after(delay, self._process_queue)
+        self.root.after(20 if remaining else 40, self._process_queue)
 
     def _do_clear(self):
         self.canvas.delete('msg')
         self.message_blocks = []
 
     def _render_message(self, msg):
-        msg_type = msg[0]
+        msg_type  = msg[0]
         max_width = self.cfg['width'] - (self.padding * 2)
-        items = []
+        items     = []
 
         if msg_type == 'system':
             _, _, message, color, _, _ = msg
-            lines = self._wrap_to_lines("» " + message, max_width, self.text_font)
+            lines   = self._wrap_to_lines("» " + message, max_width, self.text_font)
             total_h = len(lines) * self.line_spacing + self.msg_block_spacing
-
             self._make_space(total_h)
             start_y = self._get_current_bottom()
             y = start_y
-
             for line in lines:
                 self._draw_outlined_text(self.padding, y, line, self.text_font, color, items)
                 y += self.line_spacing
-
-            self.message_blocks.append({
-                'start_y': start_y, 'height': total_h, 'items': items,
-            })
+            self.message_blocks.append({'start_y': start_y, 'height': total_h, 'items': items})
             return
 
         if msg_type == 'chat':
             _, username, message, name_color, msg_color, badge = msg
-
             msg_lines = self._wrap_to_lines(message, max_width, self.text_font)
-
-            header_h = self.name_line_height
-            msg_h = len(msg_lines) * self.line_spacing
-            total_h = header_h + self.name_to_msg_gap + msg_h + self.msg_block_spacing
-
+            header_h  = self.name_line_height
+            total_h   = header_h + self.name_to_msg_gap + len(msg_lines) * self.line_spacing + self.msg_block_spacing
             self._make_space(total_h)
             start_y = self._get_current_bottom()
             y = start_y
-
-            pill_h, _ = self._draw_name_header(
-                self.padding, y, badge, username, name_color, items
-            )
+            self._draw_name_header(self.padding, y, badge, username, name_color, items)
             y += header_h + self.name_to_msg_gap
-
-            msg_indent = 4
             for line in msg_lines:
                 self._draw_outlined_text(
-                    self.padding + msg_indent, y,
-                    line, self.text_font, msg_color, items
+                    self.padding + 4, y, line, self.text_font, msg_color, items
                 )
                 y += self.line_spacing
-
-            self.message_blocks.append({
-                'start_y': start_y, 'height': total_h, 'items': items,
-            })
+            self.message_blocks.append({'start_y': start_y, 'height': total_h, 'items': items})
 
     def update_config(self, new_cfg):
-        old_width = self.cfg['width']
-        old_height = self.cfg['height']
-
+        old_w = self.cfg['width']
+        old_h = self.cfg['height']
         self.cfg.update(new_cfg)
         self._apply_geometry()
         self.root.attributes('-alpha', self.cfg['opacity'])
-
         if (self.text_font.cget('size') != self.cfg['font_size']
                 or self.text_font.cget('family') != self.cfg['font_family']):
-            self.text_font.configure(
-                size=self.cfg['font_size'],
-                family=self.cfg['font_family']
-            )
+            self.text_font.configure(size=self.cfg['font_size'], family=self.cfg['font_family'])
             self.name_font.configure(
-                size=max(9, self.cfg['font_size'] - 2),
-                family=self.cfg['font_family']
+                size=max(9, self.cfg['font_size'] - 2), family=self.cfg['font_family']
             )
-            self.line_spacing = self.cfg['font_size'] + 8
+            self.line_spacing     = self.cfg['font_size'] + 8
             self.name_line_height = max(9, self.cfg['font_size'] - 2) + 8
-
-        if old_width != self.cfg['width'] or old_height != self.cfg['height']:
+        if old_w != self.cfg['width'] or old_h != self.cfg['height']:
             self._do_clear()
-
         if self.settings_mode:
             self._redraw_settings_border()
+        self.root.after(100, self._make_click_through)
 
     def show(self):
         self.visible = True
@@ -782,18 +706,12 @@ class GhostOverlay:
         self.visible = False
         self.root.withdraw()
 
-    def toggle(self):
-        if self.visible:
-            self.hide()
-        else:
-            self.show()
-
     def close(self):
         self.running = False
         try:
             self.root.quit()
             self.root.destroy()
-        except:
+        except Exception:
             pass
 
     def run(self):
@@ -802,28 +720,26 @@ class GhostOverlay:
 
 class ControlPanel:
     WIN_W = 760
-    WIN_H = 650
+    WIN_H = 670
 
     def __init__(self, overlay: GhostOverlay, tray_ref=None):
-        self.overlay = overlay
-        self.tray_ref = tray_ref
-        self.window = None
-        self.log_text = None
-        self.sliders = {}
-        self.is_open = False
+        self.overlay       = overlay
+        self.tray_ref      = tray_ref
+        self.window        = None
+        self.log_text      = None
+        self.sliders       = {}
+        self.is_open       = False
         self.max_log_lines = 500
-        self.app_state = load_app_state()
+        self.app_state     = load_app_state()
         self._slider_debounce = {}
-
         self.channel_entry = None
-        self.connect_btn = None
+        self.connect_btn   = None
         self.disconnect_btn = None
-        self.status_label = None
+        self.status_label  = None
         self.current_channel_label = None
-        self.brand_label = None
-
+        self.brand_label   = None
         self._status_poll_id = None
-        self._notebook = None
+        self._notebook     = None
 
     def open(self):
         if self.is_open and self.window is not None:
@@ -831,7 +747,7 @@ class ControlPanel:
                 self.window.lift()
                 self.window.focus_force()
                 return
-            except:
+            except Exception:
                 pass
 
         self.window = tk.Toplevel(self.overlay.root)
@@ -841,13 +757,11 @@ class ControlPanel:
 
         sw = self.window.winfo_screenwidth()
         sh = self.window.winfo_screenheight()
-        x = (sw - self.WIN_W) // 2
-        y = (sh - self.WIN_H) // 2
-        self.window.geometry(f"{self.WIN_W}x{self.WIN_H}+{x}+{y}")
+        self.window.geometry(
+            f"{self.WIN_W}x{self.WIN_H}+{(sw-self.WIN_W)//2}+{(sh-self.WIN_H)//2}"
+        )
         self.window.minsize(640, 540)
-
         self._build_all()
-
         self.is_open = True
         self._poll_logs()
         self._poll_stats()
@@ -857,11 +771,10 @@ class ControlPanel:
         style = ttk.Style()
         try:
             style.theme_use('clam')
-        except:
+        except Exception:
             pass
         style.configure('TNotebook', background='#1e1e1e', borderwidth=0)
-        style.configure('TNotebook.Tab',
-                        background='#2a2a2a', foreground='#cccccc',
+        style.configure('TNotebook.Tab', background='#2a2a2a', foreground='#cccccc',
                         padding=[18, 8], font=('Segoe UI', 10))
         style.map('TNotebook.Tab',
                   background=[('selected', '#9146FF')],
@@ -869,33 +782,22 @@ class ControlPanel:
         style.configure('TScale', background='#1e1e1e', troughcolor='#333333')
 
         self._build_status_bar()
-
         self._notebook = ttk.Notebook(self.window)
         self._notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
-        conn_tab = tk.Frame(self._notebook, bg='#1e1e1e')
-        self._notebook.add(conn_tab, text=t("tab_connection"))
-        self._build_connection_tab(conn_tab)
-
-        log_tab = tk.Frame(self._notebook, bg='#1e1e1e')
-        self._notebook.add(log_tab, text=t("tab_logs"))
-        self._build_log_tab(log_tab)
-
-        settings_tab = tk.Frame(self._notebook, bg='#1e1e1e')
-        self._notebook.add(settings_tab, text=t("tab_settings"))
-        self._build_settings_tab(settings_tab)
-
-        stats_tab = tk.Frame(self._notebook, bg='#1e1e1e')
-        self._notebook.add(stats_tab, text=t("tab_stats"))
-        self._build_stats_tab(stats_tab)
+        for tab_key, builder in [
+            ("tab_connection", self._build_connection_tab),
+            ("tab_logs",       self._build_log_tab),
+            ("tab_settings",   self._build_settings_tab),
+            ("tab_stats",      self._build_stats_tab),
+        ]:
+            frame = tk.Frame(self._notebook, bg='#1e1e1e')
+            self._notebook.add(frame, text=t(tab_key))
+            builder(frame)
 
         def on_tab_change(event):
             idx = self._notebook.index(self._notebook.select())
-            if idx == 2:
-                self.overlay.set_settings_mode(True)
-            else:
-                self.overlay.set_settings_mode(False)
-
+            self.overlay.set_settings_mode(idx == 2)
         self._notebook.bind('<<NotebookTabChanged>>', on_tab_change)
 
     def _rebuild_ui(self):
@@ -910,135 +812,72 @@ class ControlPanel:
 
     def _build_status_bar(self):
         bar = tk.Frame(self.window, bg='#0d0d0d', height=42)
-        bar.pack(fill=tk.X, padx=0, pady=0)
+        bar.pack(fill=tk.X)
         bar.pack_propagate(False)
-
         inner = tk.Frame(bar, bg='#0d0d0d')
         inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
-
-        tk.Label(
-            inner, text="🎬 ", font=('Segoe UI', 14),
-            bg='#0d0d0d', fg='#9146FF'
-        ).pack(side=tk.LEFT)
-        self.brand_label = tk.Label(
-            inner, text=t("app_brand"),
-            font=('Segoe UI', 11, 'bold'),
-            bg='#0d0d0d', fg='#FFFFFF'
-        )
+        tk.Label(inner, text="🎬 ", font=('Segoe UI', 14),
+                 bg='#0d0d0d', fg='#9146FF').pack(side=tk.LEFT)
+        self.brand_label = tk.Label(inner, text=t("app_brand"),
+            font=('Segoe UI', 11, 'bold'), bg='#0d0d0d', fg='#FFFFFF')
         self.brand_label.pack(side=tk.LEFT)
-
-        self.status_label = tk.Label(
-            inner, text=t("status_disconnected"),
-            font=('Segoe UI', 10, 'bold'),
-            bg='#0d0d0d', fg='#888888'
-        )
+        self.status_label = tk.Label(inner, text=t("status_disconnected"),
+            font=('Segoe UI', 10, 'bold'), bg='#0d0d0d', fg='#888888')
         self.status_label.pack(side=tk.RIGHT)
-
-        self.current_channel_label = tk.Label(
-            inner, text="",
-            font=('Consolas', 10, 'bold'),
-            bg='#0d0d0d', fg='#9146FF'
-        )
+        self.current_channel_label = tk.Label(inner, text="",
+            font=('Consolas', 10, 'bold'), bg='#0d0d0d', fg='#9146FF')
         self.current_channel_label.pack(side=tk.RIGHT, padx=(0, 10))
 
     def _build_connection_tab(self, parent):
         outer = tk.Frame(parent, bg='#1e1e1e', padx=32, pady=24)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            outer, text=t("conn_title"),
-            font=('Segoe UI', 16, 'bold'),
-            bg='#1e1e1e', fg='#9146FF'
-        ).pack(pady=(0, 6), anchor='w')
-
-        tk.Label(
-            outer,
-            text=t("conn_subtitle"),
-            font=('Segoe UI', 10),
-            bg='#1e1e1e', fg='#888888',
-            justify='left'
-        ).pack(pady=(0, 24), anchor='w')
+        tk.Label(outer, text=t("conn_title"), font=('Segoe UI', 16, 'bold'),
+                 bg='#1e1e1e', fg='#9146FF').pack(pady=(0, 6), anchor='w')
+        tk.Label(outer, text=t("conn_subtitle"), font=('Segoe UI', 10),
+                 bg='#1e1e1e', fg='#888888', justify='left').pack(pady=(0, 24), anchor='w')
 
         card = tk.Frame(outer, bg='#252525', padx=24, pady=20)
         card.pack(fill=tk.X)
 
-        tk.Label(
-            card, text=t("conn_channel_label"),
-            font=('Segoe UI', 11, 'bold'),
-            bg='#252525', fg='#cccccc'
-        ).pack(anchor='w', pady=(0, 8))
+        tk.Label(card, text=t("conn_channel_label"), font=('Segoe UI', 11, 'bold'),
+                 bg='#252525', fg='#cccccc').pack(anchor='w', pady=(0, 8))
 
-        entry_frame = tk.Frame(card, bg='#0d0d0d', highlightbackground='#9146FF', highlightthickness=1)
+        entry_frame = tk.Frame(card, bg='#0d0d0d',
+                               highlightbackground='#9146FF', highlightthickness=1)
         entry_frame.pack(fill=tk.X, pady=(0, 4))
-
-        tk.Label(
-            entry_frame, text="  # ",
-            font=('Consolas', 14, 'bold'),
-            bg='#0d0d0d', fg='#9146FF'
-        ).pack(side=tk.LEFT)
-
-        self.channel_entry = tk.Entry(
-            entry_frame,
-            font=('Consolas', 14),
-            bg='#0d0d0d', fg='#FFFFFF',
-            insertbackground='#9146FF',
-            relief='flat', bd=0
-        )
+        tk.Label(entry_frame, text="  # ", font=('Consolas', 14, 'bold'),
+                 bg='#0d0d0d', fg='#9146FF').pack(side=tk.LEFT)
+        self.channel_entry = tk.Entry(entry_frame, font=('Consolas', 14),
+            bg='#0d0d0d', fg='#FFFFFF', insertbackground='#9146FF', relief='flat', bd=0)
         self.channel_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=10, padx=(0, 8))
         self.channel_entry.insert(0, self.app_state.get('last_channel', ''))
         self.channel_entry.bind('<Return>', lambda e: self._on_connect_click())
 
-        self.conn_error_label = tk.Label(
-            card, text="",
-            font=('Segoe UI', 9),
-            bg='#252525', fg='#FF5555'
-        )
+        self.conn_error_label = tk.Label(card, text="", font=('Segoe UI', 9),
+                                         bg='#252525', fg='#FF5555')
         self.conn_error_label.pack(anchor='w', pady=(4, 12))
 
         btn_frame = tk.Frame(card, bg='#252525')
         btn_frame.pack(fill=tk.X, pady=(8, 0))
-
-        self.connect_btn = tk.Button(
-            btn_frame, text=t("btn_connect"),
-            command=self._on_connect_click,
-            bg='#9146FF', fg='white',
-            font=('Segoe UI', 11, 'bold'),
-            relief='flat', padx=30, pady=12,
-            cursor='hand2',
-            activebackground='#7a36d6',
-            activeforeground='white',
-        )
+        self.connect_btn = tk.Button(btn_frame, text=t("btn_connect"),
+            command=self._on_connect_click, bg='#9146FF', fg='white',
+            font=('Segoe UI', 11, 'bold'), relief='flat', padx=30, pady=12,
+            cursor='hand2', activebackground='#7a36d6', activeforeground='white')
         self.connect_btn.pack(side=tk.LEFT, padx=(0, 8))
-
-        self.disconnect_btn = tk.Button(
-            btn_frame, text=t("btn_disconnect"),
-            command=self._on_disconnect_click,
-            bg='#444444', fg='white',
-            font=('Segoe UI', 11),
-            relief='flat', padx=30, pady=12,
-            cursor='hand2',
-            activebackground='#666666',
-            activeforeground='white',
-            state='disabled',
-        )
+        self.disconnect_btn = tk.Button(btn_frame, text=t("btn_disconnect"),
+            command=self._on_disconnect_click, bg='#444444', fg='white',
+            font=('Segoe UI', 11), relief='flat', padx=30, pady=12,
+            cursor='hand2', activebackground='#666666', activeforeground='white',
+            state='disabled')
         self.disconnect_btn.pack(side=tk.LEFT)
 
         hint = tk.Frame(outer, bg='#1e1e1e')
         hint.pack(fill=tk.X, pady=(20, 0))
-
-        tk.Label(
-            hint, text=t("hint_title"),
-            font=('Segoe UI', 9, 'bold'),
-            bg='#1e1e1e', fg='#FFCC44'
-        ).pack(anchor='w')
-
-        tk.Label(
-            hint,
-            text=t("hint_lines") + ANON_NICK,
-            font=('Segoe UI', 9),
-            bg='#1e1e1e', fg='#888888',
-            justify='left'
-        ).pack(anchor='w', pady=(4, 0))
+        tk.Label(hint, text=t("hint_title"), font=('Segoe UI', 9, 'bold'),
+                 bg='#1e1e1e', fg='#FFCC44').pack(anchor='w')
+        tk.Label(hint, text=t("hint_lines") + ANON_NICK, font=('Segoe UI', 9),
+                 bg='#1e1e1e', fg='#888888', justify='left').pack(anchor='w', pady=(4, 0))
 
     def _on_connect_click(self):
         raw = self.channel_entry.get().strip()
@@ -1046,11 +885,9 @@ class ControlPanel:
         if not ok:
             self.conn_error_label.config(text=f"✗ {val}")
             return
-
         self.conn_error_label.config(text="")
         self.app_state['last_channel'] = val
         save_app_state(self.app_state)
-
         chat_command.put(f"CONNECT:{val}")
         log_to_gui(t("log_connect_request", ch=val), "INFO")
 
@@ -1063,20 +900,20 @@ class ControlPanel:
             return
         try:
             with connection_lock:
-                connected = connection_state['connected']
+                connected  = connection_state['connected']
                 connecting = connection_state['connecting']
-                current = connection_state['current_channel']
-
+                current    = connection_state['current_channel']
+            ch_text = f"#{current}" if current else ""
             if connected:
                 self.status_label.config(text=t("status_connected"), fg='#55FF77')
-                self.current_channel_label.config(text=f"#{current}" if current else "")
+                self.current_channel_label.config(text=ch_text)
                 if self.connect_btn:
                     self.connect_btn.config(state='disabled', bg='#444444')
                 if self.disconnect_btn:
                     self.disconnect_btn.config(state='normal', bg='#aa3333')
             elif connecting:
                 self.status_label.config(text=t("status_connecting"), fg='#FFCC44')
-                self.current_channel_label.config(text=f"#{current}" if current else "")
+                self.current_channel_label.config(text=ch_text)
                 if self.connect_btn:
                     self.connect_btn.config(state='disabled', bg='#444444')
                 if self.disconnect_btn:
@@ -1088,148 +925,102 @@ class ControlPanel:
                     self.connect_btn.config(state='normal', bg='#9146FF')
                 if self.disconnect_btn:
                     self.disconnect_btn.config(state='disabled', bg='#444444')
-
             self._status_poll_id = self.window.after(500, self._poll_status)
-        except:
+        except Exception:
             pass
 
     def _build_log_tab(self, parent):
         top = tk.Frame(parent, bg='#1e1e1e')
         top.pack(fill=tk.X, padx=8, pady=(8, 4))
-
-        tk.Label(
-            top, text=t("log_title"),
-            font=('Segoe UI', 11, 'bold'),
-            bg='#1e1e1e', fg='#9146FF'
-        ).pack(side=tk.LEFT)
-
-        tk.Button(
-            top, text=t("btn_clear_log"), command=self._clear_log,
-            bg='#3a3a3a', fg='white', font=('Segoe UI', 9),
-            relief='flat', padx=12, pady=4, cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=2)
-
-        tk.Button(
-            top, text=t("btn_clear_overlay"), command=self.overlay.clear,
-            bg='#3a3a3a', fg='white', font=('Segoe UI', 9),
-            relief='flat', padx=12, pady=4, cursor='hand2'
-        ).pack(side=tk.RIGHT, padx=2)
+        tk.Label(top, text=t("log_title"), font=('Segoe UI', 11, 'bold'),
+                 bg='#1e1e1e', fg='#9146FF').pack(side=tk.LEFT)
+        tk.Button(top, text=t("btn_clear_log"), command=self._clear_log,
+                  bg='#3a3a3a', fg='white', font=('Segoe UI', 9),
+                  relief='flat', padx=12, pady=4, cursor='hand2').pack(side=tk.RIGHT, padx=2)
+        tk.Button(top, text=t("btn_clear_overlay"), command=self.overlay.clear,
+                  bg='#3a3a3a', fg='white', font=('Segoe UI', 9),
+                  relief='flat', padx=12, pady=4, cursor='hand2').pack(side=tk.RIGHT, padx=2)
 
         log_frame = tk.Frame(parent, bg='#0d0d0d')
         log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
-
         scrollbar = tk.Scrollbar(log_frame, bg='#1e1e1e', troughcolor='#0d0d0d')
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.log_text = tk.Text(
-            log_frame,
-            bg='#0d0d0d', fg='#d0d0d0',
-            font=('Consolas', 10),
-            yscrollcommand=scrollbar.set,
-            wrap='word',
-            relief='flat', bd=0,
-            insertbackground='white',
-            state='disabled'
-        )
+        self.log_text = tk.Text(log_frame, bg='#0d0d0d', fg='#d0d0d0',
+            font=('Consolas', 10), yscrollcommand=scrollbar.set,
+            wrap='word', relief='flat', bd=0, state='disabled')
         self.log_text.pack(fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.log_text.yview)
-
-        self.log_text.tag_config('time', foreground='#666666')
-        self.log_text.tag_config('INFO', foreground='#5599FF')
-        self.log_text.tag_config('OK', foreground='#55FF77')
-        self.log_text.tag_config('WARN', foreground='#FFCC44')
+        self.log_text.tag_config('time',  foreground='#666666')
+        self.log_text.tag_config('INFO',  foreground='#5599FF')
+        self.log_text.tag_config('OK',    foreground='#55FF77')
+        self.log_text.tag_config('WARN',  foreground='#FFCC44')
         self.log_text.tag_config('ERROR', foreground='#FF5555')
-        self.log_text.tag_config('CHAT', foreground='#d0d0d0')
-        self.log_text.tag_config('user', foreground='#9146FF', font=('Consolas', 10, 'bold'))
-        self.log_text.tag_config('badge', foreground='#FFCC44', font=('Consolas', 9, 'bold'))
+        self.log_text.tag_config('CHAT',  foreground='#d0d0d0')
+        self.log_text.tag_config('user',  foreground='#9146FF',
+                                          font=('Consolas', 10, 'bold'))
+        self.log_text.tag_config('badge', foreground='#FFCC44',
+                                          font=('Consolas', 9, 'bold'))
 
     def _build_settings_tab(self, parent):
-        canvas = tk.Canvas(parent, bg='#1e1e1e', highlightthickness=0)
-        scrollbar = tk.Scrollbar(parent, orient='vertical', command=canvas.yview)
+        canvas     = tk.Canvas(parent, bg='#1e1e1e', highlightthickness=0)
+        scrollbar  = tk.Scrollbar(parent, orient='vertical', command=canvas.yview)
         scrollable = tk.Frame(canvas, bg='#1e1e1e')
-
-        scrollable.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        scrollable.bind("<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=scrollable, anchor='nw')
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         main = tk.Frame(scrollable, bg='#1e1e1e', padx=24, pady=18)
         main.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            main, text=t("settings_title"),
-            font=('Segoe UI', 14, 'bold'),
-            bg='#1e1e1e', fg='#9146FF'
-        ).pack(pady=(0, 4), anchor='w')
-
-        tk.Label(
-            main, text=t("settings_hint"),
-            font=('Segoe UI', 9),
-            bg='#1e1e1e', fg='#888888',
-            justify='left'
-        ).pack(pady=(0, 16), anchor='w')
+        tk.Label(main, text=t("settings_title"), font=('Segoe UI', 14, 'bold'),
+                 bg='#1e1e1e', fg='#9146FF').pack(pady=(0, 4), anchor='w')
+        tk.Label(main, text=t("settings_hint"), font=('Segoe UI', 9),
+                 bg='#1e1e1e', fg='#888888', justify='left').pack(pady=(0, 16), anchor='w')
 
         sw = self.window.winfo_screenwidth()
         sh = self.window.winfo_screenheight()
 
         self._section_title(main, t("section_position"))
-        self._slider(main, t("slider_x"), 'x', 0, sw - 100)
-        self._slider(main, t("slider_y"), 'y', 0, sh - 100)
-        self._slider(main, t("slider_w"), 'width', 200, 1600)
-        self._slider(main, t("slider_h"), 'height', 100, 1000)
-
+        self._slider(main, t("slider_x"),   'x',            0,   sw - 100)
+        self._slider(main, t("slider_y"),   'y',            0,   sh - 100)
+        self._slider(main, t("slider_w"),   'width',        200, 1600)
+        self._slider(main, t("slider_h"),   'height',       100, 1000)
         self._section_title(main, t("section_appearance"))
-        self._slider(main, t("slider_opacity"), 'opacity', 0.1, 1.0, is_float=True)
-        self._slider(main, t("slider_font"), 'font_size', 8, 32)
-        self._slider(main, t("slider_max_msg"), 'max_messages', 20, 300)
-
+        self._slider(main, t("slider_opacity"),  'opacity',      0.1, 1.0, is_float=True)
+        self._slider(main, t("slider_font"),     'font_size',    8,   32)
+        self._slider(main, t("slider_max_msg"),  'max_messages', 20,  300)
         self._section_title(main, t("section_language"))
         self._build_language_selector(main)
 
         btn_frame = tk.Frame(main, bg='#1e1e1e')
         btn_frame.pack(pady=20, fill=tk.X)
-
-        self.save_btn = tk.Button(
-            btn_frame, text=t("btn_save"), command=self._save,
+        self.save_btn = tk.Button(btn_frame, text=t("btn_save"), command=self._save,
             bg='#2d5a27', fg='white', font=('Segoe UI', 10, 'bold'),
-            relief='flat', padx=20, pady=10, cursor='hand2'
-        )
+            relief='flat', padx=20, pady=10, cursor='hand2')
         self.save_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
-
-        tk.Button(
-            btn_frame, text=t("btn_reset"), command=self._reset,
+        tk.Button(btn_frame, text=t("btn_reset"), command=self._reset,
             bg='#444444', fg='white', font=('Segoe UI', 10),
-            relief='flat', padx=20, pady=10, cursor='hand2'
-        ).pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+            relief='flat', padx=20, pady=10, cursor='hand2').pack(
+            side=tk.LEFT, padx=5, expand=True, fill=tk.X)
 
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<MouseWheel>",
+            lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
     def _build_language_selector(self, parent):
-        frame = tk.Frame(parent, bg='#1e1e1e')
+        frame   = tk.Frame(parent, bg='#1e1e1e')
         frame.pack(fill=tk.X, pady=4)
-
         current = self.app_state.get('language', 'en')
 
         def make_btn(code, label):
             is_active = (current == code)
-            return tk.Button(
-                frame, text=label,
+            return tk.Button(frame, text=label,
                 command=lambda: self._change_language(code),
-                bg='#9146FF' if is_active else '#3a3a3a',
-                fg='white',
+                bg='#9146FF' if is_active else '#3a3a3a', fg='white',
                 font=('Segoe UI', 10, 'bold' if is_active else 'normal'),
-                relief='flat', padx=20, pady=8,
-                cursor='hand2',
-                activebackground='#7a36d6',
-                activeforeground='white',
-            )
+                relief='flat', padx=20, pady=8, cursor='hand2',
+                activebackground='#7a36d6', activeforeground='white')
 
         make_btn('en', t("lang_en")).pack(side=tk.LEFT, padx=(0, 8))
         make_btn('ru', t("lang_ru")).pack(side=tk.LEFT)
@@ -1246,71 +1037,45 @@ class ControlPanel:
     def _build_stats_tab(self, parent):
         main = tk.Frame(parent, bg='#1e1e1e', padx=24, pady=18)
         main.pack(fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            main, text=t("stats_title"),
-            font=('Segoe UI', 14, 'bold'),
-            bg='#1e1e1e', fg='#9146FF'
-        ).pack(pady=(0, 16), anchor='w')
-
+        tk.Label(main, text=t("stats_title"), font=('Segoe UI', 14, 'bold'),
+                 bg='#1e1e1e', fg='#9146FF').pack(pady=(0, 16), anchor='w')
         self.stats_labels = {}
-
         rows = [
-            ('channel', t("stats_channel")),
-            ('duration', t("stats_duration")),
-            ('messages', t("stats_messages")),
-            ('users', t("stats_users")),
-            ('mods', t("stats_mods")),
-            ('subs', t("stats_subs")),
-            ('vips', t("stats_vips")),
+            ('channel',    t("stats_channel")),
+            ('duration',   t("stats_duration")),
+            ('messages',   t("stats_messages")),
+            ('users',      t("stats_users")),
+            ('mods',       t("stats_mods")),
+            ('subs',       t("stats_subs")),
+            ('vips',       t("stats_vips")),
             ('reconnects', t("stats_reconnects")),
-            ('errors', t("stats_errors")),
-            ('pings', t("stats_pings")),
+            ('errors',     t("stats_errors")),
+            ('pings',      t("stats_pings")),
         ]
-
         for key, label_text in rows:
             row = tk.Frame(main, bg='#1e1e1e')
             row.pack(fill=tk.X, pady=4)
-            tk.Label(
-                row, text=label_text,
-                font=('Segoe UI', 10), bg='#1e1e1e', fg='#888888',
-                width=22, anchor='w'
-            ).pack(side=tk.LEFT)
-            val_label = tk.Label(
-                row, text='—',
-                font=('Consolas', 11, 'bold'), bg='#1e1e1e', fg='#00FFAA',
-                anchor='w'
-            )
-            val_label.pack(side=tk.LEFT)
-            self.stats_labels[key] = val_label
+            tk.Label(row, text=label_text, font=('Segoe UI', 10),
+                     bg='#1e1e1e', fg='#888888', width=22, anchor='w').pack(side=tk.LEFT)
+            val = tk.Label(row, text='—', font=('Consolas', 11, 'bold'),
+                           bg='#1e1e1e', fg='#00FFAA', anchor='w')
+            val.pack(side=tk.LEFT)
+            self.stats_labels[key] = val
 
     def _section_title(self, parent, text):
-        tk.Label(
-            parent, text=text,
-            font=('Segoe UI', 11, 'bold'),
-            bg='#1e1e1e', fg='#9146FF',
-            anchor='w'
-        ).pack(fill=tk.X, pady=(10, 6))
+        tk.Label(parent, text=text, font=('Segoe UI', 11, 'bold'),
+                 bg='#1e1e1e', fg='#9146FF', anchor='w').pack(fill=tk.X, pady=(10, 6))
 
     def _slider(self, parent, label_text, key, min_val, max_val, is_float=False):
         frame = tk.Frame(parent, bg='#1e1e1e')
         frame.pack(fill=tk.X, pady=4)
-
         top = tk.Frame(frame, bg='#1e1e1e')
         top.pack(fill=tk.X)
-
-        tk.Label(
-            top, text=label_text, font=('Segoe UI', 10),
-            bg='#1e1e1e', fg='#aaaaaa'
-        ).pack(side=tk.LEFT)
-
-        val_label = tk.Label(
-            top, text=str(self.overlay.cfg[key]),
-            font=('Consolas', 10, 'bold'),
-            bg='#1e1e1e', fg='#00ff00', width=8
-        )
+        tk.Label(top, text=label_text, font=('Segoe UI', 10),
+                 bg='#1e1e1e', fg='#aaaaaa').pack(side=tk.LEFT)
+        val_label = tk.Label(top, text=str(self.overlay.cfg[key]),
+            font=('Consolas', 10, 'bold'), bg='#1e1e1e', fg='#00ff00', width=8)
         val_label.pack(side=tk.RIGHT)
-
         slider = ttk.Scale(frame, from_=min_val, to=max_val, orient='horizontal', length=500)
         slider.set(self.overlay.cfg[key])
         slider.pack(fill=tk.X, pady=(3, 0))
@@ -1322,11 +1087,10 @@ class ControlPanel:
             if k in self._slider_debounce:
                 try:
                     self.window.after_cancel(self._slider_debounce[k])
-                except:
+                except Exception:
                     pass
             self._slider_debounce[k] = self.window.after(
-                30, lambda: self.overlay.update_config(self.overlay.cfg)
-            )
+                30, lambda: self.overlay.update_config(self.overlay.cfg))
 
         slider.configure(command=on_slide)
         self.sliders[key] = slider
@@ -1355,7 +1119,6 @@ class ControlPanel:
     def _poll_logs(self):
         if not self.is_open or self.window is None:
             return
-
         try:
             count = 0
             while count < 50:
@@ -1365,14 +1128,12 @@ class ControlPanel:
                     break
                 self._append_log(item)
                 count += 1
-
             if self.log_text:
                 line_count = int(self.log_text.index('end-1c').split('.')[0])
                 if line_count > self.max_log_lines:
                     self.log_text.config(state='normal')
                     self.log_text.delete('1.0', f'{line_count - self.max_log_lines}.0')
                     self.log_text.config(state='disabled')
-
             self.window.after(100, self._poll_logs)
         except Exception:
             pass
@@ -1380,17 +1141,14 @@ class ControlPanel:
     def _append_log(self, item):
         if not self.log_text:
             return
-
         try:
             self.log_text.config(state='normal')
             kind = item[0]
-
             if kind == 'system':
                 _, ts, level, message = item
                 self.log_text.insert(tk.END, f"[{ts}] ", 'time')
                 self.log_text.insert(tk.END, f"[{level}] ", level)
                 self.log_text.insert(tk.END, f"{message}\n", 'CHAT')
-
             elif kind == 'chat':
                 _, ts, user, badges, message = item
                 self.log_text.insert(tk.END, f"[{ts}] ", 'time')
@@ -1398,7 +1156,6 @@ class ControlPanel:
                     self.log_text.insert(tk.END, f"[{'/'.join(badges)}] ", 'badge')
                 self.log_text.insert(tk.END, f"{user}", 'user')
                 self.log_text.insert(tk.END, f": {message}\n", 'CHAT')
-
             self.log_text.see(tk.END)
             self.log_text.config(state='disabled')
         except Exception:
@@ -1412,28 +1169,24 @@ class ControlPanel:
             h = int(duration // 3600)
             m = int((duration % 3600) // 60)
             s = int(duration % 60)
-
             current_channel = connection_state.get('current_channel') or '—'
-
             updates = {
-                'channel': f"#{current_channel}" if current_channel != '—' else '—',
-                'duration': f"{h:02d}:{m:02d}:{s:02d}",
-                'messages': str(stats['total_messages']),
-                'users': str(len(stats['unique_users_hashed'])),
-                'mods': str(len(stats['users_by_role']['moderators'])),
-                'subs': str(len(stats['users_by_role']['subscribers'])),
-                'vips': str(len(stats['users_by_role']['vips'])),
+                'channel':    f"#{current_channel}" if current_channel != '—' else '—',
+                'duration':   f"{h:02d}:{m:02d}:{s:02d}",
+                'messages':   str(stats['total_messages']),
+                'users':      str(len(stats['unique_users_hashed'])),
+                'mods':       str(len(stats['users_by_role']['moderators'])),
+                'subs':       str(len(stats['users_by_role']['subscribers'])),
+                'vips':       str(len(stats['users_by_role']['vips'])),
                 'reconnects': str(stats['reconnects']),
-                'errors': str(stats['errors']),
-                'pings': str(stats['irc_pings']),
+                'errors':     str(stats['errors']),
+                'pings':      str(stats['irc_pings']),
             }
-
             for k, v in updates.items():
                 if k in self.stats_labels:
                     self.stats_labels[k].config(text=v)
-
             self.window.after(1000, self._poll_stats)
-        except:
+        except Exception:
             pass
 
     def _on_close(self):
@@ -1442,31 +1195,31 @@ class ControlPanel:
         if self._status_poll_id:
             try:
                 self.window.after_cancel(self._status_poll_id)
-            except:
+            except Exception:
                 pass
         try:
             self.window.destroy()
-        except:
+        except Exception:
             pass
         self.window = None
 
 
 class TrayManager:
     def __init__(self, overlay: GhostOverlay, control_panel: ControlPanel):
-        self.overlay = overlay
+        self.overlay       = overlay
         self.control_panel = control_panel
-        self.icon = None
+        self.icon          = None
 
     def _create_icon_image(self):
         size = 64
-        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        img  = Image.new('RGBA', (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse([4, 4, size - 4, size - 4], fill='#9146FF', outline='#6441A5', width=2)
+        draw.ellipse([4, 4, size-4, size-4], fill='#9146FF', outline='#6441A5', width=2)
         try:
             fnt = ImageFont.truetype("arial.ttf", 28)
-        except:
+        except Exception:
             fnt = ImageFont.load_default()
-        draw.text((size // 2, size // 2), "T", fill='white', font=fnt, anchor='mm')
+        draw.text((size//2, size//2), "T", fill='white', font=fnt, anchor='mm')
         return img
 
     def _open_panel(self, icon=None, item=None):
@@ -1491,18 +1244,15 @@ class TrayManager:
             try:
                 self.icon.menu = self._build_menu()
                 self.icon.update_menu()
-            except:
+            except Exception:
                 pass
 
     def start(self):
         if not TRAY_OK or not PIL_OK:
             return
-
         self.icon = pystray.Icon(
-            "TwitchOverlay",
-            self._create_icon_image(),
-            "Twitch Ghost Overlay",
-            self._build_menu()
+            "TwitchOverlay", self._create_icon_image(),
+            "Twitch Ghost Overlay", self._build_menu()
         )
         self.icon.run_detached()
 
@@ -1510,12 +1260,11 @@ class TrayManager:
 def log_to_gui(message, level="INFO"):
     timestamp = datetime.now().strftime("%H:%M:%S")
     log_queue.put(('system', timestamp, level, message))
-
     if system_log_file:
         try:
             system_log_file.write(f"[{timestamp}] [{level}] {message}\n")
             system_log_file.flush()
-        except:
+        except Exception:
             pass
 
 
@@ -1526,21 +1275,6 @@ def log_chat_to_gui(username, message, badges):
 
 def hash_user(username):
     return hashlib.sha256((HASH_SALT + username.lower()).encode()).hexdigest()[:12]
-
-
-def init_system_log(channel):
-    if not twitch_config["log_system"] or twitch_config["test_mode"]:
-        return None
-    try:
-        os.makedirs(LOGS_DIR, exist_ok=True)
-        today = datetime.now().strftime("%Y-%m-%d")
-        filename = os.path.join(LOGS_DIR, f"{channel}_{today}_system.log")
-        f = open(filename, "a", encoding="utf-8")
-        f.write(f"\n{'='*60}\n  Session: {datetime.now()}\n  Channel: #{channel}\n{'='*60}\n\n")
-        f.flush()
-        return f
-    except:
-        return None
 
 
 def get_color_for_user(username):
@@ -1554,24 +1288,23 @@ def save_stats_snapshot():
     if not twitch_config["log_stats"] or twitch_config["test_mode"]:
         return
     try:
-        channel = connection_state.get('current_channel') or 'unknown'
+        channel  = connection_state.get('current_channel') or 'unknown'
         os.makedirs(LOGS_DIR, exist_ok=True)
-        today = datetime.now().strftime("%Y-%m-%d")
+        today    = datetime.now().strftime("%Y-%m-%d")
         filename = os.path.join(LOGS_DIR, f"{channel}_{today}_stats.json")
         duration = time.time() - stats["session_start"]
-        snapshot = {
-            "channel": channel,
-            "session_start": stats["session_start_iso"],
-            "session_end": datetime.now().isoformat(),
-            "duration_seconds": int(duration),
-            "total_messages": stats["total_messages"],
-            "unique_users_count": len(stats["unique_users_hashed"]),
-            "errors": stats["errors"],
-            "reconnects": stats["reconnects"],
-        }
         with open(filename, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    except:
+            json.dump({
+                "channel":            channel,
+                "session_start":      stats["session_start_iso"],
+                "session_end":        datetime.now().isoformat(),
+                "duration_seconds":   int(duration),
+                "total_messages":     stats["total_messages"],
+                "unique_users_count": len(stats["unique_users_hashed"]),
+                "errors":             stats["errors"],
+                "reconnects":         stats["reconnects"],
+            }, f, ensure_ascii=False, indent=2)
+    except Exception:
         pass
 
 
@@ -1584,21 +1317,18 @@ def parse_irc_message(line):
         space_idx = line.find(" ")
         if space_idx == -1:
             return None, None, None, {}
-        tags_part = line[1:space_idx]
-        rest = line[space_idx + 1:]
-        for tag in tags_part.split(";"):
+        for tag in line[1:space_idx].split(";"):
             if "=" in tag:
                 k, v = tag.split("=", 1)
                 tags[k] = v
-
+        rest = line[space_idx + 1:]
     match = re.match(r":(\w+)!\w+@\S+\s+PRIVMSG\s+#\S+\s+:(.*)", rest)
     if not match:
         return None, None, None, {}
-
-    username = match.group(1)
-    message = match.group(2).strip()
+    username     = match.group(1)
+    message      = match.group(2).strip()
     display_name = tags.get("display-name") or username
-    color = tags.get("color") or get_color_for_user(username)
+    color        = tags.get("color") or get_color_for_user(username)
     if not color:
         color = get_color_for_user(username)
     return display_name, message, color, tags
@@ -1610,12 +1340,12 @@ def update_stats(username, message, tags):
     user_hash = hash_user(username)
     stats["total_messages"] += 1
     stats["unique_users_hashed"].add(user_hash)
-    minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
-    stats["messages_per_minute"][minute_key] += 1
-    if tags.get("mod") == "1": stats["users_by_role"]["moderators"].add(user_hash)
-    if tags.get("subscriber") == "1": stats["users_by_role"]["subscribers"].add(user_hash)
-    if tags.get("vip") == "1": stats["users_by_role"]["vips"].add(user_hash)
-    if tags.get("badges", "").startswith("broadcaster"): stats["users_by_role"]["broadcaster"].add(user_hash)
+    stats["messages_per_minute"][datetime.now().strftime("%Y-%m-%d %H:%M")] += 1
+    if tags.get("mod")         == "1": stats["users_by_role"]["moderators"].add(user_hash)
+    if tags.get("subscriber")  == "1": stats["users_by_role"]["subscribers"].add(user_hash)
+    if tags.get("vip")         == "1": stats["users_by_role"]["vips"].add(user_hash)
+    if tags.get("badges", "").startswith("broadcaster"):
+        stats["users_by_role"]["broadcaster"].add(user_hash)
 
 
 def setup_irc_connection(channel):
@@ -1633,20 +1363,16 @@ def setup_irc_connection(channel):
 
 def close_sock(sock):
     if sock:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except:
-            pass
-        try:
-            sock.close()
-        except:
-            pass
+        try: sock.shutdown(socket.SHUT_RDWR)
+        except Exception: pass
+        try: sock.close()
+        except Exception: pass
 
 
 def chat_loop(overlay: GhostOverlay):
-    sock = None
-    buffer = ""
-    last_reconnect = 0
+    sock            = None
+    buffer          = ""
+    last_reconnect  = 0
     last_stats_save = time.time()
     current_channel = None
     reconnect_count = 0
@@ -1654,45 +1380,42 @@ def chat_loop(overlay: GhostOverlay):
     while not should_stop.is_set():
         try:
             cmd = chat_command.get(timeout=0.5)
-
             if cmd == "STOP":
                 break
-
             if cmd == "DISCONNECT":
                 if sock:
                     close_sock(sock)
                     sock = None
                 with connection_lock:
-                    connection_state['connected'] = False
-                    connection_state['connecting'] = False
-                    connection_state['current_channel'] = None
-                    connection_state['sock'] = None
+                    connection_state.update({
+                        'connected': False, 'connecting': False,
+                        'current_channel': None, 'sock': None,
+                    })
                 if current_channel:
-                    overlay.add_system_message(t("ov_disconnected", ch=current_channel), '#FFAA00')
+                    overlay.add_system_message(
+                        t("ov_disconnected", ch=current_channel), '#FFAA00')
                     log_to_gui(t("log_disconnected", ch=current_channel), "INFO")
                 current_channel = None
                 reconnect_count = 0
                 continue
-
             if cmd.startswith("CONNECT:"):
                 new_channel = cmd[8:]
                 if sock:
                     close_sock(sock)
                     sock = None
-
                 current_channel = new_channel
                 reconnect_count = 0
-                buffer = ""
-
+                buffer          = ""
                 with connection_lock:
-                    connection_state['connecting'] = True
-                    connection_state['connected'] = False
-                    connection_state['current_channel'] = current_channel
-
+                    connection_state.update({
+                        'connecting': True, 'connected': False,
+                        'current_channel': current_channel,
+                        'last_activity': time.time(),
+                    })
                 overlay.clear()
-                overlay.add_system_message(t("ov_connecting", ch=current_channel), '#FFFF00')
+                overlay.add_system_message(
+                    t("ov_connecting", ch=current_channel), '#FFFF00')
                 continue
-
         except queue.Empty:
             pass
 
@@ -1706,27 +1429,25 @@ def chat_loop(overlay: GhostOverlay):
                 log_to_gui(t("log_max_reconnects"), "ERROR")
                 with connection_lock:
                     connection_state['connecting'] = False
-                    connection_state['connected'] = False
+                    connection_state['connected']  = False
                 current_channel = None
                 continue
-
             wait = max(0, 3 - (time.time() - last_reconnect))
             if wait > 0:
                 time.sleep(wait)
-
             try:
                 sock = setup_irc_connection(current_channel)
-                last_reconnect = time.time()
+                last_reconnect  = time.time()
                 reconnect_count += 1
                 stats["reconnects"] += 1
                 buffer = ""
-
                 with connection_lock:
-                    connection_state['connecting'] = False
-                    connection_state['connected'] = True
-                    connection_state['sock'] = sock
-
-                overlay.add_system_message(t("ov_connected", ch=current_channel), '#00FF00')
+                    connection_state.update({
+                        'connecting': False, 'connected': True,
+                        'sock': sock, 'last_activity': time.time(),
+                    })
+                overlay.add_system_message(
+                    t("ov_connected", ch=current_channel), '#00FF00')
             except Exception as e:
                 log_to_gui(t("log_conn_failed", e=e), "ERROR")
                 overlay.add_system_message(t("ov_conn_error", e=e), '#FF4444')
@@ -1741,54 +1462,43 @@ def chat_loop(overlay: GhostOverlay):
             except socket.timeout:
                 continue
             finally:
-                try:
-                    sock.settimeout(None)
-                except:
-                    pass
+                try: sock.settimeout(None)
+                except Exception: pass
 
             if not data:
                 raise ConnectionError("Server closed connection")
 
             buffer += data
-
             while "\r\n" in buffer:
                 line, buffer = buffer.split("\r\n", 1)
                 line = line.strip()
                 if not line:
                     continue
-
                 if line.startswith("PING"):
                     sock.send(b"PONG :tmi.twitch.tv\r\n")
                     stats["irc_pings"] += 1
+                    with connection_lock:
+                        connection_state['last_activity'] = time.time()
                     continue
-
                 username, message, color, tags = parse_irc_message(line)
                 if username and message:
-                    badges = []
+                    badges     = []
                     badge_icon = None
                     if tags.get("badges", "").startswith("broadcaster"):
-                        badges.append("STREAMER")
-                        badge_icon = "🎬"
+                        badges.append("STREAMER"); badge_icon = "🎬"
                     elif tags.get("mod") == "1":
-                        badges.append("MOD")
-                        badge_icon = "🔧"
+                        badges.append("MOD");      badge_icon = "🔧"
                     elif tags.get("vip") == "1":
-                        badges.append("VIP")
-                        badge_icon = "💎"
+                        badges.append("VIP");      badge_icon = "💎"
                     elif tags.get("subscriber") == "1":
-                        badges.append("SUB")
-                        badge_icon = "⭐"
-
+                        badges.append("SUB");      badge_icon = "⭐"
                     update_stats(username, message, tags)
                     log_chat_to_gui(username, message, badges)
-
-                    overlay.add_chat_message(
-                        username,
-                        message,
+                    with connection_lock:
+                        connection_state['last_activity'] = time.time()
+                    overlay.add_chat_message(username, message,
                         name_color=color or '#9146FF',
-                        msg_color='#FFFFFF',
-                        badge=badge_icon
-                    )
+                        msg_color='#FFFFFF', badge=badge_icon)
 
             if time.time() - last_stats_save > 60:
                 save_stats_snapshot()
@@ -1801,8 +1511,8 @@ def chat_loop(overlay: GhostOverlay):
             close_sock(sock)
             sock = None
             with connection_lock:
-                connection_state['connected'] = False
-                connection_state['connecting'] = True if current_channel else False
+                connection_state['connected']  = False
+                connection_state['connecting'] = bool(current_channel)
             time.sleep(2)
         except Exception as e:
             log_to_gui(t("log_error", e=e), "ERROR")
@@ -1815,7 +1525,7 @@ def chat_loop(overlay: GhostOverlay):
 
     close_sock(sock)
     with connection_lock:
-        connection_state['connected'] = False
+        connection_state['connected']  = False
         connection_state['connecting'] = False
 
 
@@ -1823,13 +1533,27 @@ def validate_channel_name(name):
     if not name:
         return False, t("err_empty")
     name = name.lower().lstrip("#").strip()
-    if len(name) < 3:
-        return False, t("err_short")
-    if len(name) > 25:
-        return False, t("err_long")
-    if not re.match(r"^[a-z0-9_]+$", name):
-        return False, t("err_chars")
+    if len(name) < 3:   return False, t("err_short")
+    if len(name) > 25:  return False, t("err_long")
+    if not re.match(r"^[a-z0-9_]+$", name): return False, t("err_chars")
     return True, name
+
+
+def _heartbeat_loop():
+    while not should_stop.is_set():
+        try:
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+        for _ in range(HEARTBEAT_INTERVAL * 10):
+            if should_stop.is_set():
+                break
+            time.sleep(0.1)
+    try:
+        os.remove(HEARTBEAT_FILE)
+    except Exception:
+        pass
 
 
 def parse_args():
@@ -1837,18 +1561,28 @@ def parse_args():
     parser.add_argument("channel", nargs="?", default=None)
     parser.add_argument("--help", "-h", action="store_true")
     parser.add_argument("--test", "-t", action="store_true")
+    parser.add_argument("--supervisor-pid", type=int, default=None)
     return parser.parse_args()
+
+
+def _watch_supervisor(supervisor_pid: int):
+    while not should_stop.is_set():
+        time.sleep(5)
+        try:
+            os.kill(supervisor_pid, 0)
+        except OSError:
+            log_to_gui("Supervisor gone → exiting", "WARN")
+            should_stop.set()
+            break
 
 
 def main():
     global system_log_file
 
     args = parse_args()
-
     if args.help:
-        print("Usage: python twitch_overlay.py [channel] [--test]")
+        print("Run start.pyw to launch with supervisor.")
         return
-
     if args.test:
         twitch_config["test_mode"] = True
 
@@ -1856,22 +1590,34 @@ def main():
     set_language(initial_state.get('language', 'en'))
 
     overlay_cfg = load_overlay_config()
-    overlay = GhostOverlay(overlay_cfg)
+    overlay     = GhostOverlay(overlay_cfg)
 
     log_to_gui(t("log_started"), "OK")
+    if args.supervisor_pid:
+        log_to_gui(f"Supervised by PID={args.supervisor_pid} | F8 = full restart", "OK")
+    else:
+        log_to_gui("No supervisor. Run start.pyw for F8 restart support.", "WARN")
     log_to_gui(t("log_overlay_created"), "OK")
 
-    control_panel = ControlPanel(overlay)
-    tray = TrayManager(overlay, control_panel)
+    control_panel          = ControlPanel(overlay)
+    tray                   = TrayManager(overlay, control_panel)
     control_panel.tray_ref = tray
     tray.start()
     log_to_gui(t("log_tray_created"), "OK")
 
     overlay.root.after(200, control_panel.open)
 
-    chat_thread = threading.Thread(target=chat_loop, args=(overlay,), daemon=True)
-    chat_thread.start()
+    threading.Thread(target=chat_loop, args=(overlay,),
+                     name="ChatLoop", daemon=True).start()
     log_to_gui(t("log_irc_ready"), "OK")
+
+    threading.Thread(target=_heartbeat_loop,
+                     name="Heartbeat", daemon=True).start()
+
+    if args.supervisor_pid:
+        threading.Thread(target=_watch_supervisor,
+                         args=(args.supervisor_pid,),
+                         name="SupervisorWatcher", daemon=True).start()
 
     if args.channel:
         ok, result = validate_channel_name(args.channel)
@@ -1891,10 +1637,9 @@ def main():
         if not twitch_config["test_mode"]:
             save_stats_snapshot()
         if system_log_file:
-            try:
-                system_log_file.close()
-            except:
-                pass
+            try: system_log_file.close()
+            except Exception: pass
+        sys.exit(0)
 
 
 if __name__ == "__main__":
