@@ -97,7 +97,6 @@ def _kill_child():
 
 
 def _start_child(channel: str = "") -> subprocess.Popen:
-    # Используем pythonw.exe чтобы дочерний тоже не показывал консоль
     python_exe = sys.executable
     if python_exe.endswith("python.exe"):
         pythonw = python_exe.replace("python.exe", "pythonw.exe")

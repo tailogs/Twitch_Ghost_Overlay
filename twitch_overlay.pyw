@@ -17,6 +17,8 @@ import ctypes
 from ctypes import wintypes
 import urllib.request
 import io
+import string
+import struct
 
 EMOTE_CACHE_DIR = "emote_cache"
 _emote_images = {}
@@ -56,6 +58,9 @@ DEFAULT_OVERLAY_CONFIG = {
     "opacity": 0.78, "font_size": 13, "font_family": "Consolas",
     "text_color": "#FFFFFF", "max_messages": 80,
 }
+
+_emote_pending = set()
+_emote_pending_lock = threading.Lock()
 
 DEFAULT_APP_STATE = {
     "last_channel": "",
@@ -339,6 +344,610 @@ stats = {
     },
     "errors": 0, "reconnects": 0, "irc_pings": 0,
 }
+
+
+_translate_cache = {}
+_translate_lock = threading.Lock()
+
+
+def _is_mostly_english(text: str) -> bool:
+    if not text:
+        return False
+
+    text = re.sub(r'!\w+', '', text)
+    
+    text = re.sub(r'@\w+', '', text)
+    
+    text = re.sub(r'\b[A-Z][a-z]+[A-Z]\w*\b', '', text)
+    text = re.sub(r'\b[A-Z]{2,}\w*\b', '', text)
+    
+    text = re.sub(r'\b\w*[A-Z]\w*[A-Z]\w*\b', '', text)
+    
+    text = re.sub(r'\b\d+\b', '', text)
+    text = re.sub(r'\[🔗[^\]]+\]', '', text)
+    
+    text = text.strip()
+    if not text or len(text) < 3:
+        return False
+
+    latin_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+    cyrillic_chars = sum(1 for c in text 
+                        if '\u0400' <= c <= '\u04FF' or c in 'ёЁ')
+    total_alpha = latin_chars + cyrillic_chars
+
+    if total_alpha == 0:
+        return False
+
+    latin_ratio = latin_chars / total_alpha
+
+    return latin_ratio > 0.75 and latin_chars >= 3
+
+
+def _google_translate_free(text, src='en', dest='ru'):
+    if not text or len(text) > 300:
+        return None
+
+    try:
+        import urllib.parse
+        safe_text = re.sub(r'[^\w\s\.,!?;:\'"()\[\]{}\-–—]', ' ', text,
+                           flags=re.UNICODE)
+        safe_text = safe_text[:300].strip()
+        if not safe_text:
+            return None
+
+        encoded = urllib.parse.quote(safe_text)
+        url = (
+            f"https://translate.googleapis.com/translate_a/single"
+            f"?client=gtx&sl={src}&tl={dest}&dt=t&q={encoded}"
+        )
+
+        if 'googleapis.com' not in url:
+            return None
+
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        })
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            raw = resp.read(64 * 1024)
+            data = json.loads(raw.decode('utf-8'))
+
+        translated_parts = []
+        if data and isinstance(data, list) and data[0]:
+            for part in data[0]:
+                if isinstance(part, list) and part and isinstance(part[0], str):
+                    translated_parts.append(part[0])
+        result = ''.join(translated_parts)
+
+        result = sanitize_message(result)
+        return result if result else None
+
+    except Exception:
+        return None
+
+
+def translate_if_needed(text: str):
+    if _current_lang != 'ru':
+        return text, None
+
+    clean = text
+    clean = re.sub(r'!\w+', '', clean)
+    clean = re.sub(r'@\w+', '', clean)
+    clean = re.sub(r'\[🔗[^\]]+\]', '', clean)
+    clean = re.sub(r'\b[A-Z][a-z]+[A-Z]\w*\b', '', clean)
+    clean = re.sub(r'\b[A-Z]{2,}\w*\b', '', clean)
+    clean = clean.strip()
+
+    if not clean or len(clean) < 6:
+        return text, None
+
+    if not _is_mostly_english(clean):
+        return text, None
+
+    russian_words = re.findall(r'[а-яёА-ЯЁ]{3,}', text)
+    if russian_words:
+        return text, None
+
+    cache_key = text.lower().strip()
+    with _translate_lock:
+        if cache_key in _translate_cache:
+            return text, _translate_cache[cache_key]
+
+    translated = _google_translate_free(text)
+
+    if translated and translated.lower().strip() != text.lower().strip():
+        with _translate_lock:
+            _translate_cache[cache_key] = translated
+            if len(_translate_cache) > 2000:
+                keys = list(_translate_cache.keys())
+                for k in keys[:500]:
+                    _translate_cache.pop(k, None)
+        return text, translated
+
+    return text, None
+
+
+def translate_async(text, callback):
+    def _do():
+        original, translated = translate_if_needed(text)
+        if callback:
+            callback(original, translated)
+    threading.Thread(target=_do, daemon=True, name="Translate").start()
+
+
+COMMAND_8BALL_ANSWERS_EN = [
+    "It is certain", "Without a doubt", "Yes definitely",
+    "You may rely on it", "Most likely", "Outlook good",
+    "Yes", "Signs point to yes", "Reply hazy, try again",
+    "Ask again later", "Better not tell you now",
+    "Cannot predict now", "Concentrate and ask again",
+    "Don't count on it", "My reply is no",
+    "My sources say no", "Outlook not so good", "Very doubtful",
+]
+
+COMMAND_8BALL_ANSWERS_RU = [
+    "Бесспорно", "Без сомнений", "Определённо да",
+    "Можешь положиться на это", "Скорее всего", "Хорошие перспективы",
+    "Да", "Знаки указывают — да", "Пока неясно, попробуй снова",
+    "Спроси позже", "Лучше не говорить сейчас",
+    "Невозможно предсказать", "Сконцентрируйся и спроси снова",
+    "Не рассчитывай на это", "Мой ответ — нет",
+    "Мои источники говорят — нет", "Перспективы не очень", "Весьма сомнительно",
+]
+
+COMMAND_PATTERNS = {
+    '!8ball':  r'!8ball',
+    '!roll':   r'!roll(?:\s+(\d+))?',
+    '!coin':   r'!coin|!flip',
+    '!choose': r'!choose\s+(.+)',
+    '!rate':   r'!rate\s+(.+)',
+    '!hug':    r'!hug\s+(\S+)',
+    '!love':   r'!love\s+(\S+)',
+}
+
+
+def process_chat_commands(message):
+    msg_lower = message.lower().strip()
+
+    if '!8ball' in msg_lower:
+        if _current_lang == 'ru':
+            answer = random.choice(COMMAND_8BALL_ANSWERS_RU)
+        else:
+            answer = random.choice(COMMAND_8BALL_ANSWERS_EN)
+        return message, f"🎱 {answer}"
+
+    match = re.search(r'!roll(?:\s+(\d+))?', msg_lower)
+    if match:
+        max_val = int(match.group(1)) if match.group(1) else 100
+        max_val = min(max_val, 1000000)
+        result = random.randint(1, max(1, max_val))
+        return message, f"🎲 {result}/{max_val}"
+
+    if '!coin' in msg_lower or '!flip' in msg_lower:
+        if _current_lang == 'ru':
+            result = random.choice(["Орёл 🪙", "Решка 🪙"])
+        else:
+            result = random.choice(["Heads 🪙", "Tails 🪙"])
+        return message, result
+
+    match = re.search(r'!choose\s+(.+)', message, re.IGNORECASE)
+    if match:
+        options_str = match.group(1)
+        if ' or ' in options_str.lower():
+            options = [o.strip() for o in re.split(r'\s+or\s+', options_str, flags=re.IGNORECASE)]
+        elif ',' in options_str:
+            options = [o.strip() for o in options_str.split(',')]
+        elif ' или ' in options_str.lower():
+            options = [o.strip() for o in re.split(r'\s+или\s+', options_str, flags=re.IGNORECASE)]
+        else:
+            options = options_str.split()
+        options = [o for o in options if o]
+        if options:
+            chosen = random.choice(options)
+            return message, f"👉 {chosen}"
+
+    match = re.search(r'!rate\s+(.+)', message, re.IGNORECASE)
+    if match:
+        thing = match.group(1).strip()
+        score = int(hashlib.md5(thing.lower().encode()).hexdigest()[:8], 16) % 101
+        bar_filled = score // 10
+        bar_empty = 10 - bar_filled
+        bar = '█' * bar_filled + '░' * bar_empty
+        return message, f"📊 {thing}: {score}/100 [{bar}]"
+
+    match = re.search(r'!hug\s+@?(\S+)', message, re.IGNORECASE)
+    if match:
+        target = match.group(1)
+        if _current_lang == 'ru':
+            return message, f"🤗 обнимает {target}!"
+        else:
+            return message, f"🤗 hugs {target}!"
+
+    match = re.search(r'!love\s+@?(\S+)', message, re.IGNORECASE)
+    if match:
+        target = match.group(1)
+        score = int(hashlib.md5(target.lower().encode()).hexdigest()[:8], 16) % 101
+        return message, f"💕 {target}: {score}% love"
+
+    return message, None
+
+
+_RU_PROFANITY_ROOTS = [
+    r'[хx][уy][ёеeийяю]',
+    r'[хx][уy][йяию]',
+    r'[пp][иieё][зz3][дd]',
+    r'[бb6][лl][яыаеёию][дdтt]',
+    r'[бb6][лl][яь]',
+    r'[еe][бb6][аaуыоёлнт]',
+    r'[ёе][бb6](?:[аaуыоёлнтиь])',
+    r'[сsc][уy][чкк][аоиьея]',
+    r'[сsc][рr][аa][нт]',
+    r'[мm][уy][дd][аоиьея]',
+    r'[дd][еe][рr][ьъ][мm]',
+    r'[жж][оo][пp][аоуые]',
+    r'[гg][аa][нn][дd][оo][нn]',
+    r'[зz3][аa][лl][уy][пp]',
+    r'[пp][иieё][дd][аa][рr]',
+    r'[пp][еe][дd][иieё][кk]',
+    r'[шш][лl][юy][хx]',
+    r'[шш][аa][лl][аa][вв]',
+    r'[дd][рr][оo][чч]',
+    r'[тt][рr][аa][хx]',
+    r'[нn][аa][хx][уy]',
+]
+
+_EN_PROFANITY_ROOTS = [
+    r'f+[uü]+c+k+',
+    r'f+[uü]+k+',
+    r's+h+[i1]+t+',
+    r'b+[i1]+t+c+h+',
+    r'a+s+s+h+[o0]+l+e+',
+    r'c+[uü]+n+t+',
+    r'd+[i1]+c+k+',
+    r'c+[o0]+c+k+',
+    r'p+[uü]+s+s+[yie]+',
+    r'w+h+[o0]+r+e+',
+    r'n+[i1]+g+g+',
+    r'f+a+g+',
+    r'd+a+m+n+',
+    r'b+[o0]+l+l+[o0]+c+k+',
+    r'w+a+n+k+',
+    r't+w+a+t+',
+    r'p+r+[i1]+c+k+',
+]
+
+_profanity_pattern = None
+
+
+_MAX_MSG_LEN        = 500
+_MAX_USERNAME_LEN   = 25
+_MAX_EMOTES_COUNT   = 50
+_MAX_WORD_LEN       = 60
+_MAX_REPEAT_RUN     = 8
+
+_DANGEROUS_UNICODE_RANGES = [
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2066, 0x2069),
+    (0xFFF0, 0xFFFF),
+    (0xE0000, 0xE007F),
+    (0xFE00, 0xFE0F),
+]
+
+_FORBIDDEN_CHARS = frozenset([
+    '\x00', '\x01', '\x02', '\x03', '\x04', '\x05', '\x06', '\x07',
+    '\x08', '\x0b', '\x0c', '\x0e', '\x0f', '\x10', '\x11', '\x12',
+    '\x13', '\x14', '\x15', '\x16', '\x17', '\x18', '\x19', '\x1a',
+    '\x1b', '\x1c', '\x1d', '\x1e', '\x1f', '\x7f',
+    '\u200b', '\u200c', '\u200d', '\u200e', '\u200f',
+    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+    '\u2066', '\u2067', '\u2068', '\u2069',
+    '\ufeff',
+    '\u034f',
+    '\u00ad',
+])
+
+_URL_PATTERN = re.compile(
+    r'(?i)\b(?:https?://|ftp://|//)?'
+    r'(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)'
+    r'+(?:com|ru|net|org|io|gg|tv|me|co|uk|de|fr|jp|cn|'
+    r'xyz|site|online|club|info|biz|live|stream|watch|'
+    r'bit\.ly|t\.co|goo\.gl|tinyurl)'
+    r'(?:/[^\s]*)?',
+    re.IGNORECASE | re.UNICODE
+)
+
+_IP_PATTERN = re.compile(
+    r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}'
+    r'(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'
+)
+
+_REPEAT_PATTERN = re.compile(r'(.)\1{' + str(_MAX_REPEAT_RUN) + r',}', re.UNICODE)
+
+_USERNAME_RE = re.compile(r'^[a-zA-Z0-9_]{1,25}$')
+
+
+def _is_dangerous_codepoint(cp: int) -> bool:
+    for start, end in _DANGEROUS_UNICODE_RANGES:
+        if start <= cp <= end:
+            return True
+    return False
+
+
+def sanitize_username(username: str) -> str:
+    if not username or not isinstance(username, str):
+        return "unknown"
+
+    clean = re.sub(r'[^a-zA-Z0-9_]', '', username)
+
+    clean = clean[:_MAX_USERNAME_LEN]
+
+    return clean if clean else "unknown"
+
+
+def sanitize_color(color: str) -> str:
+    if not color or not isinstance(color, str):
+        return '#9146FF'
+
+    color = color.strip()
+    if re.match(r'^#[0-9A-Fa-f]{6}$', color):
+        return color
+
+    m = re.match(r'^#([0-9A-Fa-f]{3})$', color)
+    if m:
+        r, g, b = m.group(1)
+        return f'#{r}{r}{g}{g}{b}{b}'
+
+    return '#9146FF'
+
+
+def mask_url(text: str) -> str:
+    def _replace_url(match):
+        url = match.group(0)
+        domain_match = re.search(
+            r'(?:https?://|ftp://|//)?([^/\s?#]+)',
+            url, re.IGNORECASE
+        )
+        if domain_match:
+            domain = domain_match.group(1)
+            domain = re.sub(r'^www\.', '', domain)
+            if len(domain) > 30:
+                domain = domain[:27] + '...'
+            return f'[🔗 {domain}]'
+        return '[🔗 ссылка]'
+
+    return _URL_PATTERN.sub(_replace_url, text)
+
+
+def mask_ip(text: str) -> str:
+    return _IP_PATTERN.sub('[IP скрыт]', text)
+
+
+def remove_forbidden_chars(text: str) -> str:
+    result = []
+    for char in text:
+        cp = ord(char)
+
+        if cp < 0x20 and char not in ('\t', '\n', '\r'):
+            continue
+
+        if char in _FORBIDDEN_CHARS:
+            continue
+
+        if _is_dangerous_codepoint(cp):
+            continue
+
+        result.append(char)
+
+    return ''.join(result)
+
+
+def collapse_repeats(text: str) -> str:
+    def _replace_repeat(match):
+        char = match.group(1)
+        count = len(match.group(0))
+        return f'{char}×{count}'
+
+    return _REPEAT_PATTERN.sub(_replace_repeat, text)
+
+
+def truncate_words(text: str) -> str:
+    words = text.split(' ')
+    result = []
+    for word in words:
+        if len(word) > _MAX_WORD_LEN:
+            word = word[:_MAX_WORD_LEN] + '…'
+        result.append(word)
+    return ' '.join(result)
+
+
+def limit_emotes(emotes_raw: str, message: str) -> str:
+    if not emotes_raw:
+        return ""
+
+    msg_len = len(message)
+
+    try:
+        total_positions = 0
+        blocks = emotes_raw.split('/')
+        safe_blocks = []
+
+        for block in blocks:
+            if ':' not in block:
+                continue
+            emote_id, positions_str = block.split(':', 1)
+            emote_id = emote_id.strip()
+
+            if not re.match(r'^[a-zA-Z0-9_]{1,64}$', emote_id):
+                continue
+
+            positions = positions_str.split(',')
+            safe_positions = []
+
+            for pos in positions:
+                if total_positions >= _MAX_EMOTES_COUNT:
+                    break
+                pos = pos.strip()
+                if '-' not in pos:
+                    continue
+                parts = pos.split('-', 1)
+                if len(parts) != 2:
+                    continue
+                try:
+                    start = int(parts[0])
+                    end   = int(parts[1])
+
+                    if start < 0 or end < start or start >= msg_len:
+                        continue
+                    
+                    safe_positions.append(f'{start}-{end}')
+                    total_positions += 1
+                except (ValueError, OverflowError):
+                    continue
+
+            if safe_positions:
+                safe_blocks.append(f'{emote_id}:{",".join(safe_positions)}')
+
+        return '/'.join(safe_blocks)
+
+    except Exception:
+        return emotes_raw
+
+
+def sanitize_message(text: str, preserve_positions: bool = False) -> str:
+    if not text or not isinstance(text, str):
+        return ''
+
+    text = text[:_MAX_MSG_LEN * 2]
+
+    if preserve_positions:
+        result = []
+        for char in text:
+            cp = ord(char)
+            if cp < 0x20 and char not in ('\t', '\n', '\r'):
+                result.append(' ')
+            elif char in _FORBIDDEN_CHARS:
+                result.append(' ')
+            elif _is_dangerous_codepoint(cp):
+                result.append(' ')
+            else:
+                result.append(char)
+        text = ''.join(result)
+    else:
+        text = remove_forbidden_chars(text)
+
+    if not preserve_positions:
+        text = re.sub(r'[ \t]{2,}', ' ', text)
+        text = text.strip()
+
+    if not preserve_positions:
+        text = mask_url(text)
+        text = mask_ip(text)
+        text = collapse_repeats(text)
+        text = truncate_words(text)
+
+    if len(text) > _MAX_MSG_LEN:
+        text = text[:_MAX_MSG_LEN - 1] + '…'
+
+    return text
+
+
+def sanitize_emote_id(emote_id: str) -> str | None:
+    if not emote_id or not isinstance(emote_id, str):
+        return None
+    emote_id = emote_id.strip()
+    if re.match(r'^[a-zA-Z0-9_]{1,64}$', emote_id):
+        return emote_id
+    return None
+
+
+def _build_profanity_pattern():
+    global _profanity_pattern
+    all_roots = _RU_PROFANITY_ROOTS + _EN_PROFANITY_ROOTS
+    combined = '|'.join(f'(?:{r})' for r in all_roots)
+    _profanity_pattern = re.compile(
+        r'(?<![a-zA-Zа-яА-ЯёЁ])(' + combined + r')[a-zA-Zа-яА-ЯёЁ]*',
+        re.IGNORECASE | re.UNICODE
+    )
+
+
+def censor_profanity(text):
+    if _profanity_pattern is None:
+        _build_profanity_pattern()
+
+    ranges = []
+    result_parts = []
+    last_end = 0
+
+    for match in _profanity_pattern.finditer(text):
+        start, end = match.start(), match.end()
+        word = match.group(0)
+
+        if start > last_end:
+            result_parts.append(('clean', text[last_end:start]))
+
+        censored = _censor_word(word)
+        result_parts.append(('censored', censored))
+        last_end = end
+
+    if last_end < len(text):
+        result_parts.append(('clean', text[last_end:]))
+
+    if not any(p[0] == 'censored' for p in result_parts):
+        return text, []
+
+    final_text = ""
+    censored_ranges = []
+    for part_type, part_text in result_parts:
+        if part_type == 'censored':
+            start_pos = len(final_text)
+            final_text += part_text
+            censored_ranges.append((start_pos, len(final_text)))
+        else:
+            final_text += part_text
+
+    return final_text, censored_ranges
+
+
+def _censor_word(word):
+    if len(word) <= 1:
+        return word
+    blur_chars = ['░', '▒', '▓', '█', '◼', '●', '◆']
+    result = word[0]
+    for i in range(1, len(word)):
+        result += random.choice(blur_chars)
+    return result
+
+
+def process_message_pipeline(username, message, has_emotes=False):
+    if has_emotes:
+        censored_msg = message
+        censored_ranges = []
+    else:
+        censored_msg, censored_ranges = censor_profanity(message)
+
+    cmd_msg, command_response = process_chat_commands(censored_msg)
+
+    needs_translation = False
+    if _current_lang == 'ru' and len(message.strip()) >= 6:
+        check_text = re.sub(r'!\w+|@\w+', '', message)
+        check_text = re.sub(r'\b[A-Z][a-z]+[A-Z]\w*\b', '', check_text)
+        check_text = re.sub(r'\b[A-Z]{2,}\w*\b', '', check_text)
+        check_text = check_text.strip()
+        
+        has_russian = bool(re.search(r'[а-яёА-ЯЁ]{2,}', message))
+        
+        needs_translation = (
+            not has_russian
+            and len(check_text) >= 4
+            and _is_mostly_english(check_text)
+        )
+
+    return {
+        'message': cmd_msg,
+        'command_response': command_response,
+        'censored_ranges': censored_ranges,
+        'needs_translation': needs_translation,
+    }
 
 
 class GhostOverlay:
@@ -656,10 +1265,29 @@ class GhostOverlay:
                          emotes_raw=""):
         if msg_color is None:
             msg_color = self.cfg.get('text_color', '#FFFFFF')
+
+        has_emotes = bool(emotes_raw)
+
+        result = process_message_pipeline(username, message, has_emotes=has_emotes)
+        processed_msg    = result['message']
+        command_response = result['command_response']
+        censored_ranges  = result['censored_ranges']
+        needs_translation = result['needs_translation']
+
         with self._queue_lock:
             self._message_queue.append(
-                ('chat', username, message, name_color, msg_color, badge, emotes_raw)
+                ('chat', username, processed_msg, name_color, msg_color, badge,
+                 emotes_raw, command_response, censored_ranges)
             )
+
+        if needs_translation:
+            def on_translated(original, translated):
+                if translated:
+                    with self._queue_lock:
+                        self._message_queue.append(
+                            ('translation', username, original, translated, name_color)
+                        )
+            translate_async(message, on_translated)
 
     def add_system_message(self, message, color='#AAAAAA'):
         with self._queue_lock:
@@ -684,6 +1312,8 @@ class GhostOverlay:
             try:
                 if msg[0] == '_clear':
                     self._do_clear()
+                elif msg[0] == 'translation':
+                    self._render_translation(msg)
                 else:
                     self._render_message(msg)
             except Exception as e:
@@ -718,80 +1348,211 @@ class GhostOverlay:
         if msg_type == 'chat':
             _, username, message, name_color, msg_color, badge = msg[:6]
             emotes_raw = msg[6] if len(msg) > 6 else ""
-            
+            command_response = msg[7] if len(msg) > 7 else None
+            censored_ranges = msg[8] if len(msg) > 8 else []
+
             emotes_list = parse_emotes_tag(emotes_raw, message)
-            
+
             if emotes_list:
                 self._render_chat_with_emotes(
                     username, message, name_color, msg_color, badge,
-                    emotes_list, max_width, items
+                    emotes_list, max_width, items,
+                    command_response=command_response,
+                    censored_ranges=censored_ranges,
                 )
             else:
-                msg_lines = self._wrap_to_lines(message, max_width, self.text_font)
-                header_h  = self.name_line_height
-                total_h   = (header_h + self.name_to_msg_gap
-                            + len(msg_lines) * self.line_spacing
-                            + self.msg_block_spacing)
-                self._make_space(total_h)
-                start_y = self._get_current_bottom()
-                y = start_y
-                self._draw_name_header(self.padding, y, badge, username, name_color, items)
-                y += header_h + self.name_to_msg_gap
-                for line in msg_lines:
-                    self._draw_outlined_text(
-                        self.padding + 4, y, line, self.text_font, msg_color, items
-                    )
-                    y += self.line_spacing
-                self.message_blocks.append(
-                    {'start_y': start_y, 'height': total_h, 'items': items}
+                self._render_chat_text(
+                    username, message, name_color, msg_color, badge,
+                    max_width, items,
+                    command_response=command_response,
+                    censored_ranges=censored_ranges,
                 )
 
+    def _render_chat_text(self, username, message, name_color, msg_color,
+                          badge, max_width, items,
+                          command_response=None, censored_ranges=None):
+        header_h = self.name_line_height
+        NAME_TO_MSG_GAP = max(self.name_to_msg_gap, 6)
+
+        msg_lines = self._wrap_to_lines(message, max_width, self.text_font)
+
+        cmd_lines = []
+        if command_response:
+            cmd_lines = self._wrap_to_lines(command_response, max_width, self.text_font)
+
+        total_h = (header_h + NAME_TO_MSG_GAP
+                   + len(msg_lines) * self.line_spacing
+                   + (len(cmd_lines) * self.line_spacing if cmd_lines else 0)
+                   + self.msg_block_spacing)
+
+        self._make_space(total_h)
+        start_y = self._get_current_bottom()
+        y = start_y
+
+        self._draw_name_header(self.padding, y, badge, username, name_color, items)
+        y += header_h + NAME_TO_MSG_GAP
+
+        if censored_ranges:
+            self._draw_text_with_censorship(
+                self.padding + 4, y, message, msg_color, items, censored_ranges
+            )
+            y += len(msg_lines) * self.line_spacing
+        else:
+            for line in msg_lines:
+                self._draw_outlined_text(
+                    self.padding + 4, y, line, self.text_font, msg_color, items
+                )
+                y += self.line_spacing
+
+        if cmd_lines:
+            for line in cmd_lines:
+                self._draw_outlined_text(
+                    self.padding + 8, y, line, self.text_font, '#FFCC44', items
+                )
+                y += self.line_spacing
+
+        self.message_blocks.append(
+            {'start_y': start_y, 'height': total_h, 'items': items}
+        )
+
+    def _draw_text_with_censorship(self, x, y, text, base_color, items, censored_ranges):
+        max_width = self.cfg['width'] - (self.padding * 2)
+        lines = self._wrap_to_lines(text, max_width, self.text_font)
+
+        char_offset = 0
+        for line in lines:
+            line_start = text.find(line, char_offset)
+            if line_start == -1:
+                line_start = char_offset
+
+            segments = self._split_line_by_censorship(
+                line, line_start, censored_ranges
+            )
+
+            cur_x = x
+            for seg_text, is_censored in segments:
+                if not seg_text:
+                    continue
+                if is_censored:
+                    color = '#666666'
+                    self._draw_outlined_text(
+                        cur_x, y, seg_text, self.text_font, color, items
+                    )
+                else:
+                    self._draw_outlined_text(
+                        cur_x, y, seg_text, self.text_font, base_color, items
+                    )
+                cur_x += self.text_font.measure(seg_text)
+
+            char_offset = line_start + len(line)
+            y += self.line_spacing
+
+    def _split_line_by_censorship(self, line, line_start_in_text, censored_ranges):
+        if not censored_ranges:
+            return [(line, False)]
+
+        line_end = line_start_in_text + len(line)
+        segments = []
+        pos = 0
+
+        for censor_start, censor_end in censored_ranges:
+            overlap_start = max(censor_start - line_start_in_text, 0)
+            overlap_end = min(censor_end - line_start_in_text, len(line))
+
+            if overlap_start >= len(line) or overlap_end <= 0:
+                continue
+
+            if overlap_start > pos:
+                segments.append((line[pos:overlap_start], False))
+
+            segments.append((line[overlap_start:overlap_end], True))
+            pos = overlap_end
+
+        if pos < len(line):
+            segments.append((line[pos:], False))
+
+        return segments if segments else [(line, False)]
+
+    def _render_translation(self, msg):
+        _, username, original, translated, name_color = msg[:5]
+        max_width = self.cfg['width'] - (self.padding * 2)
+        items = []
+
+        trans_text = f"  ↳ {translated}"
+        lines = self._wrap_to_lines(trans_text, max_width - 16, self.text_font)
+        total_h = len(lines) * self.line_spacing + 4
+
+        self._make_space(total_h)
+        start_y = self._get_current_bottom()
+        y = start_y
+
+        for line in lines:
+            self._draw_outlined_text(
+                self.padding + 16, y, line, self.text_font, '#7799CC', items
+            )
+            y += self.line_spacing
+
+        self.message_blocks.append(
+            {'start_y': start_y, 'height': total_h, 'items': items}
+        )
+
     def _render_chat_with_emotes(self, username, message, name_color, msg_color,
-                                  badge, emotes_list, max_width, items):
-        """Рендерит сообщение с инлайн-эмотами (картинками)."""
+                                  badge, emotes_list, max_width, items,
+                                  command_response=None, censored_ranges=None):
+        log_to_gui(f"[EMOTE] render_with_emotes: user={username}, emotes={emotes_list[:3]}", "INFO")
         parts = split_message_with_emotes(message, emotes_list)
+        log_to_gui(f"[EMOTE] parts: {parts}", "INFO")
 
         emote_photos = {}
+        missing_emotes = []
+
         for part in parts:
             if part[0] == 'emote':
                 eid = part[1]
                 if eid not in emote_photos:
                     photo = get_emote_photo(eid, self.root)
                     emote_photos[eid] = photo
+                    if photo is None:
+                        missing_emotes.append(eid)
 
         has_real_emotes = any(v is not None for v in emote_photos.values())
 
-        if not has_real_emotes:
+        if not has_real_emotes and missing_emotes:
+            self._schedule_emote_retry(
+                username, message, name_color, msg_color, badge,
+                emotes_list, command_response, censored_ranges,
+                retry_count=0
+            )
             msg_lines = self._wrap_to_lines(message, max_width, self.text_font)
             header_h = self.name_line_height
-            total_h = (header_h + self.name_to_msg_gap
+            NAME_TO_MSG_GAP = max(self.name_to_msg_gap, 6)
+            total_h = (header_h + NAME_TO_MSG_GAP
                        + len(msg_lines) * self.line_spacing
                        + self.msg_block_spacing)
             self._make_space(total_h)
             start_y = self._get_current_bottom()
             y = start_y
             self._draw_name_header(self.padding, y, badge, username, name_color, items)
-            y += header_h + self.name_to_msg_gap
+            y += header_h + NAME_TO_MSG_GAP
             for line in msg_lines:
                 self._draw_outlined_text(
                     self.padding + 4, y, line, self.text_font, msg_color, items
                 )
                 y += self.line_spacing
             self.message_blocks.append(
-                {'start_y': start_y, 'height': total_h, 'items': items}
+                {'start_y': start_y, 'height': total_h, 'items': items,
+                 '_pending_emotes': True}
             )
             return
 
-        # --- Константы отступов ---
         EMOTE_SIZE = 22
-        EMOTE_W = EMOTE_SIZE + 6    # ширина эмота + отступ справа
+        EMOTE_W = EMOTE_SIZE + 6
         EMOTE_H = EMOTE_SIZE
-        EMOTE_PAD_LEFT = 3           # отступ слева от эмота (от текста к эмоту)
-        EMOTE_PAD_RIGHT = 3          # отступ справа от эмота (от эмота к тексту)
+        EMOTE_PAD_LEFT = 3
+        EMOTE_PAD_RIGHT = 3
         indent = 4
-        NAME_TO_MSG_GAP = max(self.name_to_msg_gap, 6)  # увеличенный зазор под ником
+        NAME_TO_MSG_GAP = max(self.name_to_msg_gap, 6)
 
-        # --- Разбиваем на визуальные строки ---
         lines_content = []
         current_line = []
         current_line_w = 0
@@ -804,20 +1565,15 @@ class GhostOverlay:
                 words = text.split(' ')
                 for wi, word in enumerate(words):
                     if not word:
-                        # Пустое слово = был пробел, добавляем пробел-отступ
                         if current_line:
-                            space_w = self.text_font.measure(' ')
-                            current_line_w += space_w
+                            current_line_w += self.text_font.measure(' ')
                         continue
 
-                    # Добавляем пробел перед словом если не начало строки
                     word_display = word
                     need_space = False
                     if current_line and wi > 0:
                         need_space = True
                     elif current_line and wi == 0:
-                        # Проверяем: предыдущий элемент в current_line — 
-                        # если это эмот, нужен пробел
                         if current_line[-1][0] == 'emote':
                             need_space = True
 
@@ -841,12 +1597,7 @@ class GhostOverlay:
                 ename = part[2] if len(part) > 2 else ""
 
                 total_emote_w = EMOTE_PAD_LEFT + EMOTE_W + EMOTE_PAD_RIGHT
-
-                # Если перед эмотом есть текст — нужен отступ
-                if current_line:
-                    total_emote_w_check = total_emote_w
-                else:
-                    total_emote_w_check = EMOTE_W + EMOTE_PAD_RIGHT
+                total_emote_w_check = total_emote_w if current_line else EMOTE_W + EMOTE_PAD_RIGHT
 
                 if current_line_w + total_emote_w_check > max_width - indent and current_line:
                     lines_content.append(current_line)
@@ -873,19 +1624,14 @@ class GhostOverlay:
         if not lines_content:
             lines_content = [[('text', message)]]
 
-        # --- Расчёт высоты ---
         header_h = self.name_line_height
         text_line_h = self.line_spacing
         emote_line_h = max(self.line_spacing, EMOTE_H + 6)
 
-        # Определяем высоту каждой строки
         line_heights = []
         for line_parts in lines_content:
             has_emote_in_line = any(lp[0] == 'emote' for lp in line_parts)
-            if has_emote_in_line:
-                line_heights.append(emote_line_h)
-            else:
-                line_heights.append(text_line_h)
+            line_heights.append(emote_line_h if has_emote_in_line else text_line_h)
 
         total_content_h = sum(line_heights)
         total_h = header_h + NAME_TO_MSG_GAP + total_content_h + self.msg_block_spacing
@@ -894,17 +1640,12 @@ class GhostOverlay:
         start_y = self._get_current_bottom()
         y = start_y
 
-        # --- Рисуем ник ---
         self._draw_name_header(self.padding, y, badge, username, name_color, items)
         y += header_h + NAME_TO_MSG_GAP
 
-        # --- Рисуем строки контента ---
         for line_idx, line_parts in enumerate(lines_content):
             x = self.padding + indent
             line_h = line_heights[line_idx]
-            has_emote_in_line = any(lp[0] == 'emote' for lp in line_parts)
-
-            # Вертикальный центр строки для выравнивания текста и эмотов
             text_baseline_y = y + (line_h - self.text_font.metrics('linespace')) // 2
 
             for lpi, lp in enumerate(line_parts):
@@ -923,22 +1664,90 @@ class GhostOverlay:
                     if photo:
                         if lpi > 0:
                             x += EMOTE_PAD_LEFT
-
                         emote_y = y + (line_h - EMOTE_H) // 2
                         img_id = self.canvas.create_image(
                             x, emote_y, image=photo, anchor='nw', tags='msg'
                         )
                         items.append(img_id)
-
                         self._register_animated_item(img_id, eid)
-
                         x += EMOTE_SIZE + EMOTE_PAD_RIGHT
 
             y += line_h
 
+        if command_response:
+            cmd_lines = self._wrap_to_lines(command_response, max_width, self.text_font)
+            for line in cmd_lines:
+                self._draw_outlined_text(
+                    self.padding + 8, y, line, self.text_font, '#FFCC44', items
+                )
+                y += self.line_spacing
+            total_h += len(cmd_lines) * self.line_spacing
+
         self.message_blocks.append(
             {'start_y': start_y, 'height': total_h, 'items': items}
         )
+
+    def _schedule_emote_retry(self, username, message, name_color, msg_color,
+                               badge, emotes_list, command_response, censored_ranges,
+                               retry_count=0):
+        MAX_RETRIES = 20
+        RETRY_DELAY = 400
+
+        if retry_count >= MAX_RETRIES:
+            return
+
+        def _check():
+            if not self.running:
+                return
+
+            all_ready = True
+            for _, _, eid in emotes_list:
+                if eid not in _emote_images or _emote_images[eid] is None:
+                    gif_path = os.path.join(EMOTE_CACHE_DIR, f"{eid}.gif")
+                    png_path = os.path.join(EMOTE_CACHE_DIR, f"{eid}.png")
+                    path = None
+                    if os.path.exists(gif_path):
+                        path = gif_path
+                    elif os.path.exists(png_path):
+                        path = png_path
+
+                    if path:
+                        _load_emote_from_file(eid, path, self.root)
+
+                    if eid not in _emote_images or _emote_images[eid] is None:
+                        all_ready = False
+
+            if all_ready:
+                if self.message_blocks:
+                    last_block = self.message_blocks[-1]
+                    if last_block.get('_pending_emotes'):
+                        for iid in last_block['items']:
+                            self._animated_items.pop(iid, None)
+                            try:
+                                self.canvas.delete(iid)
+                            except Exception:
+                                pass
+                        self.message_blocks.pop()
+
+                max_width = self.cfg['width'] - (self.padding * 2)
+                items = []
+                self._render_chat_with_emotes(
+                    username, message, name_color, msg_color, badge,
+                    emotes_list, max_width, items,
+                    command_response=command_response,
+                    censored_ranges=censored_ranges,
+                )
+            else:
+                self.root.after(
+                    RETRY_DELAY,
+                    lambda: self._schedule_emote_retry(
+                        username, message, name_color, msg_color, badge,
+                        emotes_list, command_response, censored_ranges,
+                        retry_count + 1
+                    )
+                )
+
+        self.root.after(RETRY_DELAY, _check)
 
     def update_config(self, new_cfg):
         old_w = self.cfg['width']
@@ -1296,6 +2105,7 @@ class ControlPanel:
         self.app_state['language'] = lang
         save_app_state(self.app_state)
         set_language(lang)
+        _build_profanity_pattern()
         log_to_gui(t("log_lang_changed"), "OK")
         self._rebuild_ui()
 
@@ -1574,11 +2384,6 @@ def save_stats_snapshot():
 
 
 def parse_emotes_tag(emotes_str, message_text):
-    """
-    Парсит тег emotes из IRC.
-    Формат: "emote_id:start-end,start-end/emote_id:start-end"
-    Возвращает список (start, end, emote_id) отсортированный по позиции.
-    """
     if not emotes_str:
         return []
     
@@ -1603,36 +2408,60 @@ def parse_emotes_tag(emotes_str, message_text):
 
 
 def get_emote_path(emote_id):
-    """Возвращает путь к кешированной картинке эмота."""
     os.makedirs(EMOTE_CACHE_DIR, exist_ok=True)
     return os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.png")
 
 
 def download_emote(emote_id):
+    if not emote_id or not re.search(r'^[a-zA-Z0-9_]+$', str(emote_id)):
+        return None
+
     gif_path = os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.gif")
     png_path = os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.png")
+
+    cache_abs = os.path.abspath(EMOTE_CACHE_DIR)
+    for path in (gif_path, png_path):
+        if not os.path.abspath(path).startswith(cache_abs):
+            log_to_gui(f"[EMOTE] REJECT path traversal: {path}", "ERROR")
+            return None
+
     os.makedirs(EMOTE_CACHE_DIR, exist_ok=True)
 
     if os.path.exists(gif_path):
+        log_to_gui(f"[EMOTE] Already cached (gif): {emote_id}", "OK")
         return gif_path
     if os.path.exists(png_path):
+        log_to_gui(f"[EMOTE] Already cached (png): {emote_id}", "OK")
         return png_path
 
-    animated_url = f"https://static-cdn.jtvnw.net/emoticons/v2/{emote_id}/animated/dark/1.0"
-    static_url = f"https://static-cdn.jtvnw.net/emoticons/v2/{emote_id}/default/dark/1.0"
+    TRUSTED_CDN = "static-cdn.jtvnw.net"
+    animated_url = f"https://{TRUSTED_CDN}/emoticons/v2/{emote_id}/animated/dark/1.0"
+    static_url   = f"https://{TRUSTED_CDN}/emoticons/v2/{emote_id}/default/dark/1.0"
 
     for url, save_path in [(animated_url, gif_path), (static_url, png_path)]:
         try:
+            log_to_gui(f"[EMOTE] Downloading: {url}", "INFO")
             req = urllib.request.Request(url, headers={'User-Agent': 'TwitchOverlay/1.0'})
             with urllib.request.urlopen(req, timeout=5) as resp:
-                data = resp.read()
-            if len(data) > 100:  # валидный ответ
+                content_type = resp.headers.get('Content-Type', '')
+                log_to_gui(f"[EMOTE] Content-Type: {content_type}", "INFO")
+                if not any(ct in content_type for ct in
+                           ('image/gif', 'image/png', 'image/webp', 'image/jpeg')):
+                    log_to_gui(f"[EMOTE] REJECT bad content-type: {content_type}", "WARN")
+                    continue
+                data = resp.read(5 * 1024 * 1024)
+            if len(data) > 100:
                 with open(save_path, 'wb') as f:
                     f.write(data)
+                log_to_gui(f"[EMOTE] Saved {emote_id} → {save_path} ({len(data)} bytes)", "OK")
                 return save_path
-        except Exception:
+            else:
+                log_to_gui(f"[EMOTE] Too small: {len(data)} bytes", "WARN")
+        except Exception as e:
+            log_to_gui(f"[EMOTE] Download error {url}: {e}", "WARN")
             continue
 
+    log_to_gui(f"[EMOTE] FAILED to download: {emote_id}", "ERROR")
     return None
 
 
@@ -1643,62 +2472,83 @@ def get_emote_photo(emote_id, root):
     if not PIL_OK:
         return None
 
-    with _emote_download_lock:
-        if emote_id in _emote_images:
-            return _emote_images[emote_id]
+    gif_path = os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.gif")
+    png_path = os.path.join(EMOTE_CACHE_DIR, f"{emote_id}.png")
 
-        path = download_emote(emote_id)
-        if not path:
-            _emote_images[emote_id] = None
-            return None
+    existing_path = None
+    if os.path.exists(gif_path):
+        existing_path = gif_path
+    elif os.path.exists(png_path):
+        existing_path = png_path
 
-        try:
-            from PIL import ImageTk
+    if existing_path:
+        return _load_emote_from_file(emote_id, existing_path, root)
+    else:
+        with _emote_pending_lock:
+            if emote_id not in _emote_pending:
+                _emote_pending.add(emote_id)
+                threading.Thread(
+                    target=_download_and_cache_emote,
+                    args=(emote_id,),        # без root!
+                    daemon=True,
+                    name=f"EmoteDL-{emote_id}"
+                ).start()
+        return None
 
-            pil_img = Image.open(path)
 
-            is_animated = getattr(pil_img, 'is_animated', False)
-            n_frames = getattr(pil_img, 'n_frames', 1)
+def _load_emote_from_file(emote_id, path, root):
+    try:
+        from PIL import ImageTk
+        log_to_gui(f"[EMOTE] Loading from file: {path}", "INFO")
 
-            if is_animated and n_frames > 1:
-                frames = []
-                delays = []
+        pil_img = Image.open(path)
+        is_animated = getattr(pil_img, 'is_animated', False)
+        n_frames = getattr(pil_img, 'n_frames', 1)
+        log_to_gui(f"[EMOTE] {emote_id}: animated={is_animated}, frames={n_frames}", "INFO")
 
-                for i in range(n_frames):
-                    pil_img.seek(i)
-                    frame = pil_img.copy().convert('RGBA')
-                    frame = frame.resize((22, 22), Image.LANCZOS)
-                    photo = ImageTk.PhotoImage(frame, master=root)
-                    frames.append(photo)
-
-                    delay = pil_img.info.get('duration', 100)
-                    if delay < 20:
-                        delay = 100
-                    delays.append(delay)
-
-                _emote_frames[emote_id] = frames
-                _emote_delays[emote_id] = delays
-                _emote_is_animated[emote_id] = True
-                _emote_images[emote_id] = frames[0]
-                return frames[0]
-            else:
-                frame = pil_img.convert('RGBA').resize((22, 22), Image.LANCZOS)
+        if is_animated and n_frames > 1:
+            frames = []
+            delays = []
+            for i in range(n_frames):
+                pil_img.seek(i)
+                frame = pil_img.copy().convert('RGBA')
+                frame = frame.resize((22, 22), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(frame, master=root)
-                _emote_images[emote_id] = photo
-                _emote_is_animated[emote_id] = False
-                return photo
+                frames.append(photo)
+                delay = pil_img.info.get('duration', 100)
+                if delay < 20:
+                    delay = 100
+                delays.append(delay)
 
-        except Exception as e:
-            log_to_gui(f"Emote load error {emote_id}: {e}", "WARN")
-            _emote_images[emote_id] = None
-            return None
+            _emote_frames[emote_id] = frames
+            _emote_delays[emote_id] = delays
+            _emote_is_animated[emote_id] = True
+            _emote_images[emote_id] = frames[0]
+            log_to_gui(f"[EMOTE] Loaded animated {emote_id}: {n_frames} frames", "OK")
+            return frames[0]
+        else:
+            frame = pil_img.convert('RGBA').resize((22, 22), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(frame, master=root)
+            _emote_images[emote_id] = photo
+            _emote_is_animated[emote_id] = False
+            log_to_gui(f"[EMOTE] Loaded static {emote_id}", "OK")
+            return photo
+
+    except Exception as e:
+        log_to_gui(f"[EMOTE] Load error {emote_id}: {e}", "ERROR")
+        _emote_images[emote_id] = None
+        return None
+
+
+def _download_and_cache_emote(emote_id):
+    try:
+        path = download_emote(emote_id)
+    finally:
+        with _emote_pending_lock:
+            _emote_pending.discard(emote_id)
 
 
 def split_message_with_emotes(message, emotes_list):
-    """
-    Разбивает сообщение на куски: текст и эмоты.
-    Возвращает список: [('text', 'hello '), ('emote', 'emote_id', 'Kappa'), ('text', ' world')]
-    """
     if not emotes_list:
         return [('text', message)]
     
@@ -1897,6 +2747,24 @@ def chat_loop(overlay: GhostOverlay):
                     continue
                 username, message, color, tags = parse_irc_message(line)
                 if username and message:
+                    username = sanitize_username(username)
+                    color    = sanitize_color(color)
+
+                    emotes_raw_str = tags.get("emotes", "")
+
+                    if emotes_raw_str:
+                        emotes_raw_str = limit_emotes(emotes_raw_str, message)
+
+                    has_emotes = bool(emotes_raw_str)
+                    if has_emotes:
+                        message = sanitize_message(message, preserve_positions=True)
+                    else:
+                        message = sanitize_message(message, preserve_positions=False)
+
+                    if not message or not username:
+                        continue
+                    # ─────────────────────────────────────────────────────
+
                     badges     = []
                     badge_icon = None
                     if tags.get("badges", "").startswith("broadcaster"):
@@ -1907,24 +2775,27 @@ def chat_loop(overlay: GhostOverlay):
                         badges.append("VIP");      badge_icon = "💎"
                     elif tags.get("subscriber") == "1":
                         badges.append("SUB");      badge_icon = "⭐"
+
                     update_stats(username, message, tags)
                     log_chat_to_gui(username, message, badges)
+
                     with connection_lock:
                         connection_state['last_activity'] = time.time()
-                    # Предзагрузка эмотов в фоне
-                    emotes_raw_str = tags.get("emotes", "")
+
                     if emotes_raw_str:
                         emotes_parsed = parse_emotes_tag(emotes_raw_str, message)
                         for _, _, eid in emotes_parsed:
-                            if not os.path.exists(get_emote_path(eid)):
+                            safe_eid = sanitize_emote_id(eid)
+                            if safe_eid and not os.path.exists(get_emote_path(safe_eid)):
                                 threading.Thread(
-                                    target=download_emote, args=(eid,),
+                                    target=download_emote, args=(safe_eid,),
                                     daemon=True
                                 ).start()
+
                     overlay.add_chat_message(username, message,
-                        name_color=color or '#9146FF',
+                        name_color=color,
                         msg_color='#FFFFFF', badge=badge_icon,
-                        emotes_raw=tags.get("emotes", ""))
+                        emotes_raw=emotes_raw_str)
 
             if time.time() - last_stats_save > 60:
                 save_stats_snapshot()
