@@ -1,87 +1,68 @@
-# 🎬 Twitch Chat
+# 🎬 Twitch Ghost Overlay
 
-Transparent, click-through Twitch chat overlay for Windows.  
-Shows chat on top of games and apps without blocking mouse input.
+[![Version](https://img.shields.io/badge/version-1.1.3-blue)]()
+[![Platform](https://img.shields.io/badge/platform-Windows-blue)]()
+[![Python](https://img.shields.io/badge/python-3.8%2B-green)]()
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
-![Python](https://img.shields.io/badge/python-3.8%2B-green)
-![License](https://img.shields.io/badge/license-MIT-orange)
+> Transparent, click-through Twitch chat overlay for Windows.
 
 ## ✨ Features
 
-- 👻 Click-through overlay
+- 👻 Click-through overlay (mouse passes through)
 - 🔝 Always on top
 - 🔌 Anonymous Twitch IRC connection
-- 🎨 Colored usernames and role badges
-- ⚙ Live overlay settings
+- 🎨 Colored usernames & role badges (STREAMER/MOD/VIP/SUB)
+- 🎬 Twitch emote support (animated & static)
+- 🔔 Keyword alerts with custom images/GIFs
 - 🌍 English / Russian UI
 - 📊 Session statistics
-- 💾 Saved config and last channel
+- 💾 Auto-save settings
 
 ## 📦 Requirements
 
-- Windows 10 / 11
+- Windows 10/11
 - Python 3.8+
-- `pywin32`
-- `pystray`
-- `Pillow`
 
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/tailogs/twitch_chat.git
+git clone https://github.com/tailogs/Twitch_Ghost_Overlay.git
 cd twitch_chat
-python -m venv venv
-venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Or install manually:
+## ▶️ Usage
 
 ```bash
-pip install pywin32 pystray Pillow
+python twitch_ghost_overlay.py          # Normal run
+python twitch_ghost_overlay.py shroud   # Auto-connect to channel
+python twitch_ghost_overlay.py --test   # Test mode (no logs)
 ```
 
-## ▶ Usage
+## 🖥️ Controls
 
-Run normally:
+- **F8** — Full restart
+- **Right-click tray** — Open/Quit
+- **Settings tab** — Adjust position, size, opacity, language
 
-```bash
-python twitch_chat.pyw
-```
+## 📁 Config Files
 
-Run with auto-connect channel:
-
-```bash
-python twitch_chat.pyw shroud
-```
-
-Run without saving logs:
-
-```bash
-python twitch_chat.pyw --test
-```
-
-## 🖥 Interface
-
-- **Connection** — connect/disconnect from Twitch chat
-- **Logs** — system messages and chat log
-- **Settings** — position, size, opacity, font size, language
-- **Statistics** — messages, users, reconnects, errors
-
-## ⚙ Saved Files
-
-- `overlay_config.json` — overlay settings
-- `app_state.json` — last channel and language
-- `chat_logs/` — system logs and anonymized stats
+| File | Description |
+|------|-------------|
+| `overlay_config.json` | Position, size, opacity, font |
+| `app_state.json` | Last channel & language |
+| `alerts_config.json` | Keyword alerts |
 
 ## 🔒 Privacy
 
-- Anonymous connection only
-- No Twitch login required
-- Chat messages are not saved to disk
-- Usernames in stats are hashed
+- Anonymous connection — no login required
+- No chat logging to disk
+- Usernames hashed in stats
 
 ## 📄 License
 
 MIT
+
+## 👨‍💻 Developer
+
+**Tailogs** — v1.1.3

@@ -20,13 +20,7 @@ import io
 import string
 import struct
 
-EMOTE_CACHE_DIR = "emote_cache"
-_emote_images = {}
-_emote_frames = {}
-_emote_delays = {}
-_emote_is_animated = {}
-_emote_download_lock = threading.Lock()
-_animated_canvas_items = {}
+# ==================== ИМПОРТЫ ДЛЯ WINDOWS И GUI ====================
 
 try:
     import win32gui
@@ -42,16 +36,35 @@ except ImportError:
     TRAY_OK = False
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
     PIL_OK = True
 except ImportError:
     PIL_OK = False
 
-HEARTBEAT_FILE     = "heartbeat.tmp"
-HEARTBEAT_INTERVAL = 5
+# ==================== ИНФОРМАЦИЯ О ПРОГРАММЕ ====================
+APP_NAME = "Twitch Ghost Overlay"
+APP_VERSION = "1.1.3"
+APP_AUTHOR = "Tailogs"
+APP_YEAR = "2026"
+APP_DESCRIPTION = "Overlay for Twitch chat with alert system"
 
+# ==================== КОНСТАНТЫ И КОНФИГИ (оставил как было) ====================
+
+HEARTBEAT_FILE = "heartbeat.tmp"
 OVERLAY_CONFIG_FILE = "overlay_config.json"
-APP_STATE_FILE      = "app_state.json"
+APP_STATE_FILE = "app_state.json"
+ALERTS_CONFIG_FILE = "alerts_config.json"
+EMOTE_CACHE_DIR = "emote_cache"
+LOGS_DIR = "chat_logs"
+
+_emote_images = {}
+_emote_frames = {}
+_emote_delays = {}
+_emote_is_animated = {}
+_emote_download_lock = threading.Lock()
+_animated_canvas_items = {}
+
+HEARTBEAT_INTERVAL = 5
 
 DEFAULT_OVERLAY_CONFIG = {
     "x": 50, "y": 50, "width": 550, "height": 450,
@@ -66,8 +79,6 @@ DEFAULT_APP_STATE = {
     "last_channel": "",
     "language": "en",
 }
-
-ALERTS_CONFIG_FILE = "alerts_config.json"
 
 DEFAULT_ALERTS_CONFIG = {
     "alerts": [],
@@ -165,6 +176,26 @@ TRANSLATIONS = {
         "lang_en": "🇬🇧 English",
         "lang_ru": "🇷🇺 Russian",
         "tab_alerts": "  🔔  Alerts  ",
+        "alerts_title": "🔔  Keyword Alerts",
+        "alerts_subtitle": "When a keyword appears in chat, an image pops up on the overlay.",
+        "alerts_enable": "Enable alerts",
+        "alerts_cooldown": "Cooldown (sec):",
+        "alerts_keywords": "Keywords:",
+        "alerts_keywords_hint": " (comma separated)",
+        "alerts_image": "Image file:",
+        "alerts_browse": "📂 Browse",
+        "alerts_label": "Label:",
+        "alerts_duration": "Duration (ms):",
+        "alerts_add": "➕ Add / Update",
+        "alerts_delete": "🗑 Delete selected",
+        "alerts_test": "▶ Test alert",
+        "alerts_saved": "Alert saved: {keywords}",
+        "alerts_deleted": "Alert deleted",
+        "alerts_test_fired": "Alert test fired: {label}",
+        "about_title": "About",
+        "about_text": "{name} v{version}\nDeveloped by {author}\n{year}\n\n{description}",
+        "about_developer": "Developer: {author}",
+        "about_version": "Version: {version}",
     },
     "ru": {
         "app_title": "Twitch Overlay",
@@ -249,6 +280,26 @@ TRANSLATIONS = {
         "lang_en": "🇬🇧 English",
         "lang_ru": "🇷🇺 Русский",
         "tab_alerts": "  🔔  Алерты  ",
+        "alerts_title": "🔔  Алерты по ключевым словам",
+        "alerts_subtitle": "Когда ключевое слово появляется в чате, на оверлее появляется изображение.",
+        "alerts_enable": "Включить алерты",
+        "alerts_cooldown": "Задержка (сек):",
+        "alerts_keywords": "Ключевые слова:",
+        "alerts_keywords_hint": " (через запятую)",
+        "alerts_image": "Файл изображения:",
+        "alerts_browse": "📂 Выбрать",
+        "alerts_label": "Метка:",
+        "alerts_duration": "Длительность (мс):",
+        "alerts_add": "➕ Добавить / Обновить",
+        "alerts_delete": "🗑 Удалить выбранное",
+        "alerts_test": "▶ Тест алерта",
+        "alerts_saved": "Алерт сохранён: {keywords}",
+        "alerts_deleted": "Алерт удалён",
+        "alerts_test_fired": "Тестовый алерт: {label}",
+        "about_title": "О программе",
+        "about_text": "{name} v{version}\nРазработчик: {author}\n{year}\n\n{description}",
+        "about_developer": "Разработчик: {author}",
+        "about_version": "Версия: {version}",
     },
 }
 
@@ -319,7 +370,6 @@ def save_app_state(state):
 TWITCH_HOST = "irc.chat.twitch.tv"
 TWITCH_PORT = 6667
 ANON_NICK   = "justinfan" + str(random.randint(10000, 99999))
-LOGS_DIR    = "chat_logs"
 
 DEFAULT_COLORS = [
     "#FF6699", "#00FFAA", "#FFAA00", "#66CCFF",
@@ -614,9 +664,9 @@ def process_chat_commands(message):
 
     if '!coin' in msg_lower or '!flip' in msg_lower:
         if _current_lang == 'ru':
-            result = random.choice(["Орёл 🪙", "Решка 🪙"])
+            result = random.choice(["Орёл 🦅", "Решка 👑"])
         else:
-            result = random.choice(["Heads 🪙", "Tails 🪙"])
+            result = random.choice(["Heads 🦅", "Tails 👑"])
         return message, result
 
     match = re.search(r'!choose\s+(.+)', message, re.IGNORECASE)
@@ -2110,6 +2160,17 @@ class ControlPanel:
         self._status_poll_id = None
         self._notebook     = None
 
+    def _save_on_close(self):
+        try:
+            if self.window and self.window.winfo_exists() and self.channel_entry:
+                channel = self.channel_entry.get().strip()
+                if channel:
+                    state = load_app_state()
+                    state['last_channel'] = channel
+                    save_app_state(state)
+        except Exception:
+            pass
+
     def open(self):
         if self.is_open and self.window is not None:
             try:
@@ -2120,7 +2181,7 @@ class ControlPanel:
                 pass
 
         self.window = tk.Toplevel(self.overlay.root)
-        self.window.title(t("app_title"))
+        self.window.title(f"{t('app_title')} v{APP_VERSION}")
         self.window.configure(bg='#1e1e1e')
         self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -2135,6 +2196,45 @@ class ControlPanel:
         self._poll_logs()
         self._poll_stats()
         self._poll_status()
+        
+        self.window.bind('<Destroy>', lambda e: self._save_on_close())
+
+    def _show_about(self):
+        about_text = t("about_text", 
+                       name=APP_NAME,
+                       version=APP_VERSION,
+                       author=APP_AUTHOR,
+                       year=APP_YEAR,
+                       description=APP_DESCRIPTION)
+        
+        about_window = tk.Toplevel(self.window)
+        about_window.title(t("about_title"))
+        about_window.configure(bg='#1e1e1e')
+        about_window.geometry("400x250")
+        about_window.resizable(False, False)
+        
+        about_window.transient(self.window)
+        about_window.grab_set()
+        
+        tk.Label(about_window, text="🎬", font=('Segoe UI', 48),
+                 bg='#1e1e1e', fg='#9146FF').pack(pady=(20, 5))
+        
+        tk.Label(about_window, text=f"{APP_NAME} v{APP_VERSION}",
+                 font=('Segoe UI', 16, 'bold'), bg='#1e1e1e', fg='#FFFFFF').pack()
+        
+        tk.Label(about_window, text=f"{t('about_developer', author=APP_AUTHOR)}",
+                 font=('Segoe UI', 10), bg='#1e1e1e', fg='#888888').pack(pady=(5, 0))
+        
+        tk.Label(about_window, text=APP_YEAR,
+                 font=('Segoe UI', 10), bg='#1e1e1e', fg='#666666').pack()
+        
+        tk.Label(about_window, text=APP_DESCRIPTION,
+                 font=('Segoe UI', 9), bg='#1e1e1e', fg='#aaaaaa',
+                 wraplength=350, justify='center').pack(pady=(15, 10))
+        
+        tk.Button(about_window, text="OK", command=about_window.destroy,
+                  bg='#9146FF', fg='white', font=('Segoe UI', 10, 'bold'),
+                  relief='flat', padx=30, pady=8, cursor='hand2').pack(pady=10)
 
     def _build_all(self):
         style = ttk.Style()
@@ -2149,6 +2249,9 @@ class ControlPanel:
                   background=[('selected', '#9146FF')],
                   foreground=[('selected', 'white')])
         style.configure('TScale', background='#1e1e1e', troughcolor='#333333')
+
+        saved_lang = self.app_state.get('language', 'en')
+        set_language(saved_lang)
 
         self._build_status_bar()
         self._notebook = ttk.Notebook(self.window)
@@ -2179,6 +2282,10 @@ class ControlPanel:
         self._build_all()
         if self.tray_ref:
             self.tray_ref.rebuild_menu()
+        
+        if hasattr(self, '_notebook') and self._notebook:
+            self._notebook.select(0)
+            self.overlay.set_settings_mode(False)
 
     def _build_status_bar(self):
         bar = tk.Frame(self.window, bg='#0d0d0d', height=42)
@@ -2188,9 +2295,14 @@ class ControlPanel:
         inner.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
         tk.Label(inner, text="🎬 ", font=('Segoe UI', 14),
                  bg='#0d0d0d', fg='#9146FF').pack(side=tk.LEFT)
-        self.brand_label = tk.Label(inner, text=t("app_brand"),
+        self.brand_label = tk.Label(inner, text=f"{t('app_brand')} v{APP_VERSION}",
             font=('Segoe UI', 11, 'bold'), bg='#0d0d0d', fg='#FFFFFF')
         self.brand_label.pack(side=tk.LEFT)
+        
+        dev_label = tk.Label(inner, text=f"  |  {t('about_developer', author=APP_AUTHOR)}",
+            font=('Segoe UI', 9), bg='#0d0d0d', fg='#666666')
+        dev_label.pack(side=tk.LEFT, padx=(8, 0))
+        
         self.status_label = tk.Label(inner, text=t("status_disconnected"),
             font=('Segoe UI', 10, 'bold'), bg='#0d0d0d', fg='#888888')
         self.status_label.pack(side=tk.RIGHT)
@@ -2257,7 +2369,7 @@ class ControlPanel:
             return
         self.conn_error_label.config(text="")
         self.app_state['last_channel'] = val
-        save_app_state(self.app_state)
+        save_app_state(self.app_state)  # Уже есть
         chat_command.put(f"CONNECT:{val}")
         log_to_gui(t("log_connect_request", ch=val), "INFO")
 
@@ -2379,21 +2491,27 @@ class ControlPanel:
             lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
     def _build_language_selector(self, parent):
-        frame   = tk.Frame(parent, bg='#1e1e1e')
+        frame = tk.Frame(parent, bg='#1e1e1e')
         frame.pack(fill=tk.X, pady=4)
         current = self.app_state.get('language', 'en')
 
         def make_btn(code, label):
             is_active = (current == code)
-            return tk.Button(frame, text=label,
+            btn = tk.Button(frame, text=label,
                 command=lambda: self._change_language(code),
                 bg='#9146FF' if is_active else '#3a3a3a', fg='white',
                 font=('Segoe UI', 10, 'bold' if is_active else 'normal'),
                 relief='flat', padx=20, pady=8, cursor='hand2',
                 activebackground='#7a36d6', activeforeground='white')
+            return btn
 
-        make_btn('en', t("lang_en")).pack(side=tk.LEFT, padx=(0, 8))
-        make_btn('ru', t("lang_ru")).pack(side=tk.LEFT)
+        btn_en = make_btn('en', t("lang_en"))
+        btn_ru = make_btn('ru', t("lang_ru"))
+        btn_en.pack(side=tk.LEFT, padx=(0, 8))
+        btn_ru.pack(side=tk.LEFT)
+        
+        self.lang_btn_en = btn_en
+        self.lang_btn_ru = btn_ru
 
     def _change_language(self, lang):
         if lang == self.app_state.get('language'):
@@ -2563,13 +2681,24 @@ class ControlPanel:
     def _on_close(self):
         self.is_open = False
         self.overlay.set_settings_mode(False)
+        
+        try:
+            if self.channel_entry and self.window and self.window.winfo_exists():
+                channel = self.channel_entry.get().strip()
+                if channel:
+                    self.app_state['last_channel'] = channel
+                    save_app_state(self.app_state)
+        except Exception:
+            pass
+        
         if self._status_poll_id:
             try:
                 self.window.after_cancel(self._status_poll_id)
             except Exception:
                 pass
         try:
-            self.window.destroy()
+            if self.window:
+                self.window.destroy()
         except Exception:
             pass
         self.window = None
@@ -2578,23 +2707,22 @@ class ControlPanel:
         outer = tk.Frame(parent, bg='#1e1e1e', padx=20, pady=16)
         outer.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(outer, text="🔔  Keyword Alerts",
+        tk.Label(outer, text=t("alerts_title"),
                  font=('Segoe UI', 14, 'bold'), bg='#1e1e1e', fg='#9146FF').pack(anchor='w', pady=(0, 4))
-        tk.Label(outer,
-                 text="When a keyword appears in chat, an image pops up on the overlay.",
+        tk.Label(outer, text=t("alerts_subtitle"),
                  font=('Segoe UI', 9), bg='#1e1e1e', fg='#888888').pack(anchor='w', pady=(0, 14))
 
         glob_frame = tk.Frame(outer, bg='#252525', padx=12, pady=10)
         glob_frame.pack(fill=tk.X, pady=(0, 10))
 
         self._alerts_enabled_var = tk.BooleanVar(value=_alerts_config.get('enabled', True))
-        tk.Checkbutton(glob_frame, text="Enable alerts", variable=self._alerts_enabled_var,
+        tk.Checkbutton(glob_frame, text=t("alerts_enable"), variable=self._alerts_enabled_var,
                        bg='#252525', fg='white', selectcolor='#9146FF',
                        activebackground='#252525', activeforeground='white',
                        font=('Segoe UI', 10),
                        command=self._save_alerts_global).pack(side=tk.LEFT)
 
-        tk.Label(glob_frame, text="Cooldown (sec):", bg='#252525', fg='#aaaaaa',
+        tk.Label(glob_frame, text=t("alerts_cooldown"), bg='#252525', fg='#aaaaaa',
                  font=('Segoe UI', 9)).pack(side=tk.LEFT, padx=(20, 4))
         self._cooldown_var = tk.StringVar(value=str(_alerts_config.get('cooldown', 10)))
         cooldown_entry = tk.Entry(glob_frame, textvariable=self._cooldown_var, width=5,
@@ -2627,33 +2755,33 @@ class ControlPanel:
 
         kw_row = tk.Frame(editor, bg='#252525')
         kw_row.pack(fill=tk.X, pady=3)
-        lbl(kw_row, 0, "Keywords:")
+        lbl(kw_row, 0, t("alerts_keywords"))
         self._alert_kw_var = tk.StringVar()
         tk.Entry(kw_row, textvariable=self._alert_kw_var, bg='#0d0d0d', fg='white',
                  insertbackground='white', relief='flat', font=('Consolas', 10)).pack(
             side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(kw_row, text=" (comma separated)", bg='#252525', fg='#666666',
+        tk.Label(kw_row, text=t("alerts_keywords_hint"), bg='#252525', fg='#666666',
                  font=('Segoe UI', 8)).pack(side=tk.LEFT)
 
         url_row = tk.Frame(editor, bg='#252525')
         url_row.pack(fill=tk.X, pady=3)
-        lbl(url_row, 0, "Image file:")
+        lbl(url_row, 0, t("alerts_image"))
         self._alert_url_var = tk.StringVar()
         tk.Entry(url_row, textvariable=self._alert_url_var, bg='#0d0d0d', fg='white',
                  insertbackground='white', relief='flat', font=('Consolas', 10)).pack(
             side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Button(url_row, text="📂 Browse", command=self._browse_alert_image,
+        tk.Button(url_row, text=t("alerts_browse"), command=self._browse_alert_image,
                   bg='#3a3a3a', fg='white', font=('Segoe UI', 9),
                   relief='flat', padx=10, pady=3, cursor='hand2').pack(side=tk.LEFT)
 
         meta_row = tk.Frame(editor, bg='#252525')
         meta_row.pack(fill=tk.X, pady=3)
-        lbl(meta_row, 0, "Label:")
+        lbl(meta_row, 0, t("alerts_label"))
         self._alert_label_var = tk.StringVar(value="🔥")
         tk.Entry(meta_row, textvariable=self._alert_label_var, width=12,
                  bg='#0d0d0d', fg='white', insertbackground='white',
                  relief='flat', font=('Consolas', 10)).pack(side=tk.LEFT, padx=(0, 20))
-        tk.Label(meta_row, text="Duration (ms):", bg='#252525', fg='#aaaaaa',
+        tk.Label(meta_row, text=t("alerts_duration"), bg='#252525', fg='#aaaaaa',
                  font=('Segoe UI', 9)).pack(side=tk.LEFT)
         self._alert_dur_var = tk.StringVar(value="4000")
         tk.Entry(meta_row, textvariable=self._alert_dur_var, width=7,
@@ -2662,13 +2790,13 @@ class ControlPanel:
 
         btn_row = tk.Frame(editor, bg='#252525')
         btn_row.pack(fill=tk.X, pady=(10, 0))
-        tk.Button(btn_row, text="➕ Add / Update", command=self._alert_add_or_update,
+        tk.Button(btn_row, text=t("alerts_add"), command=self._alert_add_or_update,
                   bg='#2d5a27', fg='white', font=('Segoe UI', 10, 'bold'),
                   relief='flat', padx=14, pady=7, cursor='hand2').pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(btn_row, text="🗑 Delete selected", command=self._alert_delete,
+        tk.Button(btn_row, text=t("alerts_delete"), command=self._alert_delete,
                   bg='#6a1a1a', fg='white', font=('Segoe UI', 10),
                   relief='flat', padx=14, pady=7, cursor='hand2').pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(btn_row, text="▶ Test alert", command=self._alert_test,
+        tk.Button(btn_row, text=t("alerts_test"), command=self._alert_test,
                   bg='#1a3a6a', fg='white', font=('Segoe UI', 10),
                   relief='flat', padx=14, pady=7, cursor='hand2').pack(side=tk.LEFT)
 
@@ -2727,7 +2855,7 @@ class ControlPanel:
         
         self._alert_kw_var.set("")
         self._alert_url_var.set("")
-        log_to_gui(f"Alert saved: {keywords}", "OK")
+        log_to_gui(t("alerts_saved", keywords=', '.join(keywords)), "OK")
 
     def _alert_delete(self):
         sel = self._alerts_listbox.curselection()
@@ -2744,16 +2872,7 @@ class ControlPanel:
         cfg['alerts'] = alerts
         save_alerts_config(cfg)
         self._refresh_alerts_list()
-        log_to_gui("Alert deleted", "INFO")
-
-    def _save_alerts_global(self):
-        cfg = _alerts_config.copy()
-        cfg['enabled'] = self._alerts_enabled_var.get()
-        try:
-            cfg['cooldown'] = max(0, int(self._cooldown_var.get()))
-        except Exception:
-            pass
-        save_alerts_config(cfg)
+        log_to_gui(t("alerts_deleted"), "INFO")
 
     def _alert_test(self):
         url   = self._alert_url_var.get().strip()
@@ -2764,7 +2883,16 @@ class ControlPanel:
             duration = 4000
         test_alert = {'image_url': url, 'label': label, 'duration': duration, 'keywords': []}
         self.overlay.trigger_alert(test_alert)
-        log_to_gui(f"Alert test fired: {label}", "INFO")
+        log_to_gui(t("alerts_test_fired", label=label), "INFO")
+
+    def _save_alerts_global(self):
+        cfg = _alerts_config.copy()
+        cfg['enabled'] = self._alerts_enabled_var.get()
+        try:
+            cfg['cooldown'] = max(0, int(self._cooldown_var.get()))
+        except Exception:
+            pass
+        save_alerts_config(cfg)
 
     def _browse_alert_image(self):
         filepath = filedialog.askopenfilename(
@@ -2787,32 +2915,58 @@ class TrayManager:
 
     def _create_icon_image(self):
         size = 64
-        img  = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
         draw.ellipse([4, 4, size-4, size-4], fill='#9146FF', outline='#6441A5', width=2)
         try:
             fnt = ImageFont.truetype("arial.ttf", 28)
+            fnt_small = ImageFont.truetype("arial.ttf", 14)
         except Exception:
             fnt = ImageFont.load_default()
-        draw.text((size//2, size//2), "T", fill='white', font=fnt, anchor='mm')
+            fnt_small = ImageFont.load_default()
+        
+        draw.text((size//2, size//2 - 4), "T", fill='white', font=fnt, anchor='mm')
+        
+        draw.text((size//2, size//2 + 16), APP_VERSION, fill='#FFD700', 
+                  font=fnt_small, anchor='mm')
+        
         return img
 
     def _open_panel(self, icon=None, item=None):
-        self.overlay.root.after(0, self.control_panel.open)
+        self.overlay.root.after_idle(self.control_panel.open)
 
     def _quit(self, icon=None, item=None):
+        try:
+            if (self.control_panel.window and 
+                self.control_panel.window.winfo_exists() and 
+                self.control_panel.channel_entry):
+                channel = self.control_panel.channel_entry.get().strip()
+                if channel:
+                    state = load_app_state()
+                    state['last_channel'] = channel
+                    save_app_state(state)
+        except Exception as e:
+            pass
+        
         should_stop.set()
         chat_command.put("STOP")
         if self.icon:
             self.icon.stop()
-        self.overlay.root.after(0, self.overlay.close)
+        self.overlay.close()
 
     def _build_menu(self):
         return pystray.Menu(
             pystray.MenuItem(t("tray_open"), self._open_panel, default=True),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"ℹ️ {t('about_title')}", self._show_about),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(f"{APP_NAME} v{APP_VERSION}", None, enabled=False),
             pystray.MenuItem(t("tray_quit"), self._quit),
         )
+
+    def _show_about(self, icon=None, item=None):
+        if self.overlay.root:
+            self.overlay.root.after_idle(self.control_panel._show_about)
 
     def rebuild_menu(self):
         if self.icon:
@@ -2829,7 +2983,11 @@ class TrayManager:
             "TwitchOverlay", self._create_icon_image(),
             "Twitch Ghost Overlay", self._build_menu()
         )
-        self.icon.run_detached()
+        threading.Thread(target=self._run_icon, daemon=True).start()
+
+    def _run_icon(self):
+        if self.icon:
+            self.icon.run()
 
 
 def log_to_gui(message, level="INFO"):
@@ -3440,5 +3598,71 @@ def main():
         sys.exit(0)
 
 
+def run_overlay():
+    global system_log_file
+
+    args = parse_args()
+    if args.test:
+        twitch_config["test_mode"] = True
+
+    load_alerts_config()
+    initial_state = load_app_state()
+    
+    saved_lang = initial_state.get('language', 'en')
+    set_language(saved_lang)
+    
+    if not os.path.exists(APP_STATE_FILE):
+        save_app_state(DEFAULT_APP_STATE)
+
+    overlay_cfg = load_overlay_config()
+    overlay = GhostOverlay(overlay_cfg)
+
+    log_to_gui(t("log_started"), "OK")
+    log_to_gui(t("log_overlay_created"), "OK")
+
+    control_panel = ControlPanel(overlay)
+    tray = TrayManager(overlay, control_panel)
+    control_panel.tray_ref = tray
+    tray.start()
+    log_to_gui(t("log_tray_created"), "OK")
+
+    overlay.root.after(200, control_panel.open)
+
+    threading.Thread(target=chat_loop, args=(overlay,), name="ChatLoop", daemon=True).start()
+    log_to_gui(t("log_irc_ready"), "OK")
+
+    if args.channel:
+        ok, result = validate_channel_name(args.channel)
+        if ok:
+            state = load_app_state()
+            state['last_channel'] = result
+            save_app_state(state)
+            overlay.root.after(800, lambda: chat_command.put(f"CONNECT:{result}"))
+
+    try:
+        overlay.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        should_stop.set()
+        chat_command.put("STOP")
+        if not twitch_config.get("test_mode", False):
+            save_stats_snapshot()
+        
+        try:
+            if (control_panel.window and 
+                control_panel.window.winfo_exists() and 
+                control_panel.channel_entry):
+                channel = control_panel.channel_entry.get().strip()
+                if channel:
+                    state = load_app_state()
+                    state['last_channel'] = channel
+                    save_app_state(state)
+        except Exception:
+            pass
+            
+        log_to_gui("Overlay закрыт", "INFO")
+
+
 if __name__ == "__main__":
-    main()
+    run_overlay()
