@@ -27,7 +27,7 @@
 
 ```bash
 git clone https://github.com/tailogs/Twitch_Ghost_Overlay.git
-cd twitch_chat
+cd Twitch_Ghost_Overlay
 pip install -r requirements.txt
 ```
 
@@ -65,4 +65,4 @@ MIT
 
 ## 👨‍💻 Developer
 
-**Tailogs** — v1.1.3
+**Tailogs**
