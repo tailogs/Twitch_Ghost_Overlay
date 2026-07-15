@@ -43,7 +43,7 @@ except ImportError:
 
 # ==================== ИНФОРМАЦИЯ О ПРОГРАММЕ ====================
 APP_NAME = "Twitch Ghost Overlay"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.2.4"
 APP_AUTHOR = "Tailogs"
 APP_YEAR = "2026"
 APP_DESCRIPTION = "Overlay for Twitch chat with alert system"
@@ -70,6 +70,9 @@ DEFAULT_OVERLAY_CONFIG = {
     "x": 50, "y": 50, "width": 550, "height": 450,
     "opacity": 0.78, "font_size": 13, "font_family": "Consolas",
     "text_color": "#FFFFFF", "max_messages": 80,
+    "bg_color": "#0a0a0a",
+    "bg_enabled": True,              # <-- новый ключ (вкл/выкл фона)
+    "translation_color": "#44DDFF",
 }
 
 _emote_pending = set()
@@ -196,6 +199,8 @@ TRANSLATIONS = {
         "about_text": "{name} v{version}\nDeveloped by {author}\n{year}\n\n{description}",
         "about_developer": "Developer: {author}",
         "about_version": "Version: {version}",
+        "settings_show_bg": "Show message background",
+        "settings_translation_color": "Translation color",
     },
     "ru": {
         "app_title": "Twitch Overlay",
@@ -300,6 +305,8 @@ TRANSLATIONS = {
         "about_text": "{name} v{version}\nРазработчик: {author}\n{year}\n\n{description}",
         "about_developer": "Разработчик: {author}",
         "about_version": "Версия: {version}",
+        "settings_show_bg": "Показывать фон сообщений",
+        "settings_translation_color": "Цвет перевода",
     },
 }
 
@@ -523,30 +530,24 @@ def _is_mostly_english(text: str) -> bool:
     return latin_ratio > 0.75 and latin_chars >= 3
 
 
-def _google_translate_free(text, src='en', dest='ru'):
+def _google_translate_free(text, dest='ru'):
+    """Перевод с автоопределением языка на указанный целевой язык."""
     if not text or len(text) > 300:
         return None
-
     try:
         import urllib.parse
-        safe_text = re.sub(r'[^\w\s\.,!?;:\'"()\[\]{}\-–—]', ' ', text,
-                           flags=re.UNICODE)
+        safe_text = re.sub(r'[^\w\s\.,!?;:\'"()\[\]{}\-–—]', ' ', text, flags=re.UNICODE)
         safe_text = safe_text[:300].strip()
         if not safe_text:
             return None
 
         encoded = urllib.parse.quote(safe_text)
+        # Используем 'auto' для автоматического определения исходного языка
         url = (
             f"https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl={src}&tl={dest}&dt=t&q={encoded}"
+            f"?client=gtx&sl=auto&tl={dest}&dt=t&q={encoded}"
         )
-
-        if 'googleapis.com' not in url:
-            return None
-
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        })
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=3) as resp:
             raw = resp.read(64 * 1024)
             data = json.loads(raw.decode('utf-8'))
@@ -557,34 +558,19 @@ def _google_translate_free(text, src='en', dest='ru'):
                 if isinstance(part, list) and part and isinstance(part[0], str):
                     translated_parts.append(part[0])
         result = ''.join(translated_parts)
-
         result = sanitize_message(result)
         return result if result else None
-
     except Exception:
         return None
 
 
 def translate_if_needed(text: str):
-    if _current_lang != 'ru':
+    """Пытается перевести текст на текущий язык интерфейса, если это необходимо."""
+    if not text or len(text) < 4:
         return text, None
 
-    clean = text
-    clean = re.sub(r'!\w+', '', clean)
-    clean = re.sub(r'@\w+', '', clean)
-    clean = re.sub(r'\[🔗[^\]]+\]', '', clean)
-    clean = re.sub(r'\b[A-Z][a-z]+[A-Z]\w*\b', '', clean)
-    clean = re.sub(r'\b[A-Z]{2,}\w*\b', '', clean)
-    clean = clean.strip()
-
-    if not clean or len(clean) < 6:
-        return text, None
-
-    if not _is_mostly_english(clean):
-        return text, None
-
-    russian_words = re.findall(r'[а-яёА-ЯЁ]{3,}', text)
-    if russian_words:
+    # Команды не переводим
+    if text.lstrip().startswith('!'):
         return text, None
 
     cache_key = text.lower().strip()
@@ -592,7 +578,8 @@ def translate_if_needed(text: str):
         if cache_key in _translate_cache:
             return text, _translate_cache[cache_key]
 
-    translated = _google_translate_free(text)
+    # Переводим на текущий язык интерфейса
+    translated = _google_translate_free(text, dest=_current_lang)
 
     if translated and translated.lower().strip() != text.lower().strip():
         with _translate_lock:
@@ -1067,20 +1054,13 @@ def process_message_pipeline(username, message, has_emotes=False):
 
     cmd_msg, command_response = process_chat_commands(censored_msg)
 
-    needs_translation = False
-    if _current_lang == 'ru' and len(message.strip()) >= 6:
-        check_text = re.sub(r'!\w+|@\w+', '', message)
-        check_text = re.sub(r'\b[A-Z][a-z]+[A-Z]\w*\b', '', check_text)
-        check_text = re.sub(r'\b[A-Z]{2,}\w*\b', '', check_text)
-        check_text = check_text.strip()
-        
-        has_russian = bool(re.search(r'[а-яёА-ЯЁ]{2,}', message))
-        
-        needs_translation = (
-            not has_russian
-            and len(check_text) >= 4
-            and _is_mostly_english(check_text)
-        )
+    # Очищаем от команд и упоминаний для проверки
+    clean_check = re.sub(r'!\w+|@\w+', '', cmd_msg).strip()
+    # Убираем ограничение на количество слов – оставляем только длину >= 4 и не команду
+    needs_translation = (
+        len(clean_check) >= 4
+        and not cmd_msg.lstrip().startswith('!')
+    )
 
     return {
         'message': cmd_msg,
@@ -1135,6 +1115,10 @@ class GhostOverlay:
         self.root.after(200, self._make_click_through)
         self.root.after(500, self._keep_topmost_loop)
         self.root.after(33,  self._process_queue)
+
+    def _get_bg_color_with_alpha(self):
+        """Возвращает цвет фона (без альфа-канала)."""
+        return self.cfg.get('bg_color', '#0a0a0a')
 
     def _apply_geometry(self):
         w, h = self.cfg['width'], self.cfg['height']
@@ -1673,21 +1657,36 @@ class GhostOverlay:
         self._animated_items = {}
 
     def _render_message(self, msg):
-        msg_type  = msg[0]
+        msg_type = msg[0]
         max_width = self.cfg['width'] - (self.padding * 2)
-        items     = []
+        items = []
 
         if msg_type == 'system':
             _, _, message, color, _, _ = msg[:6]
-            lines   = self._wrap_to_lines("» " + message, max_width, self.text_font)
+            lines = self._wrap_to_lines("» " + message, max_width, self.text_font)
             total_h = len(lines) * self.line_spacing + self.msg_block_spacing
             self._make_space(total_h)
             start_y = self._get_current_bottom()
             y = start_y
+
+            bg_id = None
+            if self.cfg.get('bg_enabled', True):
+                bg_id = self.canvas.create_rectangle(
+                    self.padding, start_y,
+                    self.cfg['width'] - self.padding, start_y + total_h,
+                    fill=self._get_bg_color_with_alpha(), outline='', tags='msg'
+                )
+                items.append(bg_id)
+
             for line in lines:
                 self._draw_outlined_text(self.padding, y, line, self.text_font, color, items)
                 y += self.line_spacing
-            self.message_blocks.append({'start_y': start_y, 'height': total_h, 'items': items})
+            self.message_blocks.append({
+                'start_y': start_y,
+                'height': total_h,
+                'items': items,
+                'bg_id': bg_id   # может быть None
+            })
             return
 
         if msg_type == 'chat':
@@ -1734,6 +1733,15 @@ class GhostOverlay:
         start_y = self._get_current_bottom()
         y = start_y
 
+        bg_id = None
+        if self.cfg.get('bg_enabled', True):
+            bg_id = self.canvas.create_rectangle(
+                self.padding, start_y,
+                self.cfg['width'] - self.padding, start_y + total_h,
+                fill=self._get_bg_color_with_alpha(), outline='', tags='msg'
+            )
+            items.append(bg_id)
+
         self._draw_name_header(self.padding, y, badge, username, name_color, items)
         y += header_h + NAME_TO_MSG_GAP
 
@@ -1756,9 +1764,12 @@ class GhostOverlay:
                 )
                 y += self.line_spacing
 
-        self.message_blocks.append(
-            {'start_y': start_y, 'height': total_h, 'items': items}
-        )
+        self.message_blocks.append({
+            'start_y': start_y,
+            'height': total_h,
+            'items': items,
+            'bg_id': bg_id
+        })
 
     def _draw_text_with_censorship(self, x, y, text, base_color, items, censored_ranges):
         max_width = self.cfg['width'] - (self.padding * 2)
@@ -1831,15 +1842,28 @@ class GhostOverlay:
         start_y = self._get_current_bottom()
         y = start_y
 
+        bg_id = None
+        if self.cfg.get('bg_enabled', True):
+            bg_id = self.canvas.create_rectangle(
+                self.padding, start_y,
+                self.cfg['width'] - self.padding, start_y + total_h,
+                fill=self._get_bg_color_with_alpha(), outline='', tags='msg'
+            )
+            items.append(bg_id)
+
         for line in lines:
+            translation_color = self.cfg.get('translation_color', '#44DDFF')
             self._draw_outlined_text(
-                self.padding + 16, y, line, self.text_font, '#7799CC', items
+                self.padding + 16, y, line, self.text_font, translation_color, items
             )
             y += self.line_spacing
 
-        self.message_blocks.append(
-            {'start_y': start_y, 'height': total_h, 'items': items}
-        )
+        self.message_blocks.append({
+            'start_y': start_y,
+            'height': total_h,
+            'items': items,
+            'bg_id': bg_id
+        })
 
     def _render_chat_with_emotes(self, username, message, name_color, msg_color,
                                   badge, emotes_list, max_width, items,
@@ -1862,6 +1886,7 @@ class GhostOverlay:
 
         has_real_emotes = any(v is not None for v in emote_photos.values())
 
+        # ==================== Блок, если эмодзи ещё не загружены ====================
         if not has_real_emotes and missing_emotes:
             self._schedule_emote_retry(
                 username, message, name_color, msg_color, badge,
@@ -1877,6 +1902,16 @@ class GhostOverlay:
             self._make_space(total_h)
             start_y = self._get_current_bottom()
             y = start_y
+
+            bg_id = None
+            if self.cfg.get('bg_enabled', True):
+                bg_id = self.canvas.create_rectangle(
+                    self.padding, start_y,
+                    self.cfg['width'] - self.padding, start_y + total_h,
+                    fill=self._get_bg_color_with_alpha(), outline='', tags='msg'
+                )
+                items.append(bg_id)
+
             self._draw_name_header(self.padding, y, badge, username, name_color, items)
             y += header_h + NAME_TO_MSG_GAP
             for line in msg_lines:
@@ -1884,12 +1919,16 @@ class GhostOverlay:
                     self.padding + 4, y, line, self.text_font, msg_color, items
                 )
                 y += self.line_spacing
-            self.message_blocks.append(
-                {'start_y': start_y, 'height': total_h, 'items': items,
-                 '_pending_emotes': True}
-            )
+            self.message_blocks.append({
+                'start_y': start_y,
+                'height': total_h,
+                'items': items,
+                'bg_id': bg_id,
+                '_pending_emotes': True
+            })
             return
 
+        # ==================== Основной блок (эмодзи загружены) ====================
         EMOTE_SIZE = 22
         EMOTE_W = EMOTE_SIZE + 6
         EMOTE_H = EMOTE_SIZE
@@ -1985,6 +2024,16 @@ class GhostOverlay:
         start_y = self._get_current_bottom()
         y = start_y
 
+        # ----- Прямоугольник фона (с проверкой) -----
+        bg_id = None
+        if self.cfg.get('bg_enabled', True):
+            bg_id = self.canvas.create_rectangle(
+                self.padding, start_y,
+                self.cfg['width'] - self.padding, start_y + total_h,
+                fill=self._get_bg_color_with_alpha(), outline='', tags='msg'
+            )
+            items.append(bg_id)
+
         self._draw_name_header(self.padding, y, badge, username, name_color, items)
         y += header_h + NAME_TO_MSG_GAP
 
@@ -2028,9 +2077,12 @@ class GhostOverlay:
                 y += self.line_spacing
             total_h += len(cmd_lines) * self.line_spacing
 
-        self.message_blocks.append(
-            {'start_y': start_y, 'height': total_h, 'items': items}
-        )
+        self.message_blocks.append({
+            'start_y': start_y,
+            'height': total_h,
+            'items': items,
+            'bg_id': bg_id
+        })
 
     def _schedule_emote_retry(self, username, message, name_color, msg_color,
                                badge, emotes_list, command_response, censored_ranges,
@@ -2097,19 +2149,36 @@ class GhostOverlay:
     def update_config(self, new_cfg):
         old_w = self.cfg['width']
         old_h = self.cfg['height']
+        old_bg = self.cfg.get('bg_color')
+        old_trans = self.cfg.get('translation_color')
+        old_enabled = self.cfg.get('bg_enabled', True)
+        
         self.cfg.update(new_cfg)
         self._apply_geometry()
         self.root.attributes('-alpha', self.cfg['opacity'])
+        
         if (self.text_font.cget('size') != self.cfg['font_size']
                 or self.text_font.cget('family') != self.cfg['font_family']):
             self.text_font.configure(size=self.cfg['font_size'], family=self.cfg['font_family'])
             self.name_font.configure(
                 size=max(9, self.cfg['font_size'] - 2), family=self.cfg['font_family']
             )
-            self.line_spacing     = self.cfg['font_size'] + 8
+            self.line_spacing = self.cfg['font_size'] + 8
             self.name_line_height = max(9, self.cfg['font_size'] - 2) + 8
+
+        # Если изменился цвет фона или его включение – перерисовываем всё
+        if (self.cfg.get('bg_color') != old_bg or
+            self.cfg.get('bg_enabled', True) != old_enabled):
+            self._do_clear()
+
+        # Если изменился цвет перевода – перерисовываем
+        if self.cfg.get('translation_color') != old_trans:
+            self._do_clear()
+
+        # Если изменились размеры окна – перерисовываем
         if old_w != self.cfg['width'] or old_h != self.cfg['height']:
             self._do_clear()
+            
         if self.settings_mode:
             self._redraw_settings_border()
         self.root.after(100, self._make_click_through)
@@ -2159,6 +2228,43 @@ class ControlPanel:
         self.brand_label   = None
         self._status_poll_id = None
         self._notebook     = None
+
+    def _color_setting(self, parent, label_text, key):
+        """Добавляет строку с полем ввода цвета и кнопкой выбора."""
+        frame = tk.Frame(parent, bg='#1e1e1e')
+        frame.pack(fill=tk.X, pady=4)
+
+        tk.Label(frame, text=label_text, font=('Segoe UI', 10),
+                 bg='#1e1e1e', fg='#aaaaaa', width=20, anchor='w').pack(side=tk.LEFT)
+
+        var = tk.StringVar(value=self.overlay.cfg.get(key, '#000000'))
+        entry = tk.Entry(frame, textvariable=var, width=10,
+                         bg='#0d0d0d', fg='white', relief='flat',
+                         font=('Consolas', 10))
+        entry.pack(side=tk.LEFT, padx=(5, 5))
+
+        def pick_color():
+            from tkinter import colorchooser
+            color = colorchooser.askcolor(title="Choose color", initialcolor=var.get())
+            if color and color[1]:
+                var.set(color[1])
+                self.overlay.cfg[key] = color[1]
+                self.overlay.update_config(self.overlay.cfg)
+                self.overlay._do_clear()  # перерисовываем все сообщения с новым цветом
+
+        btn = tk.Button(frame, text="🎨", command=pick_color,
+                        bg='#3a3a3a', fg='white', relief='flat',
+                        padx=6, pady=2, cursor='hand2')
+        btn.pack(side=tk.LEFT)
+
+        def on_color_change(*args):
+            val = var.get().strip()
+            if re.match(r'^#[0-9a-fA-F]{6}$', val):
+                self.overlay.cfg[key] = val
+                self.overlay.update_config(self.overlay.cfg)
+                self.overlay._do_clear()
+
+        var.trace('w', on_color_change)
 
     def _save_on_close(self):
         try:
@@ -2444,8 +2550,8 @@ class ControlPanel:
                                           font=('Consolas', 9, 'bold'))
 
     def _build_settings_tab(self, parent):
-        canvas     = tk.Canvas(parent, bg='#1e1e1e', highlightthickness=0)
-        scrollbar  = tk.Scrollbar(parent, orient='vertical', command=canvas.yview)
+        canvas = tk.Canvas(parent, bg='#1e1e1e', highlightthickness=0)
+        scrollbar = tk.Scrollbar(parent, orient='vertical', command=canvas.yview)
         scrollable = tk.Frame(canvas, bg='#1e1e1e')
         scrollable.bind("<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -2464,18 +2570,40 @@ class ControlPanel:
         sw = self.window.winfo_screenwidth()
         sh = self.window.winfo_screenheight()
 
+        # ----- Позиция и размер -----
         self._section_title(main, t("section_position"))
         self._slider(main, t("slider_x"),   'x',            0,   sw - 100)
         self._slider(main, t("slider_y"),   'y',            0,   sh - 100)
         self._slider(main, t("slider_w"),   'width',        200, 1600)
         self._slider(main, t("slider_h"),   'height',       100, 1000)
+
+        # ----- Внешний вид -----
         self._section_title(main, t("section_appearance"))
         self._slider(main, t("slider_opacity"),  'opacity',      0.1, 1.0, is_float=True)
         self._slider(main, t("slider_font"),     'font_size',    8,   32)
         self._slider(main, t("slider_max_msg"),  'max_messages', 20,  300)
+
+        # ----- Включение фона сообщений (галочка) -----
+        bg_enabled_var = tk.BooleanVar(value=self.overlay.cfg.get('bg_enabled', True))
+        def on_bg_toggle():
+            self.overlay.cfg['bg_enabled'] = bg_enabled_var.get()
+            self.overlay.update_config(self.overlay.cfg)
+        cb = tk.Checkbutton(main, text=t("settings_show_bg"),
+                            variable=bg_enabled_var, command=on_bg_toggle,
+                            bg='#1e1e1e', fg='white', selectcolor='#9146FF',
+                            activebackground='#1e1e1e', activeforeground='white',
+                            font=('Segoe UI', 10))
+        cb.pack(anchor='w', pady=4)
+
+        # ----- Язык -----
         self._section_title(main, t("section_language"))
         self._build_language_selector(main)
 
+        # ----- Цвет перевода -----
+        self._section_title(main, "🎨 " + t("settings_translation_color"))
+        self._color_setting(main, t("settings_translation_color") + ":", "translation_color")
+
+        # ----- Кнопки -----
         btn_frame = tk.Frame(main, bg='#1e1e1e')
         btn_frame.pack(pady=20, fill=tk.X)
         self.save_btn = tk.Button(btn_frame, text=t("btn_save"), command=self._save,
@@ -2597,6 +2725,9 @@ class ControlPanel:
         for key, slider in self.sliders.items():
             if key in new_cfg:
                 slider.set(new_cfg[key])
+        # Обновляем поля ввода цвета (если они есть) – можно пройтись по всем _color_setting виджетам
+        # Проще перестроить интерфейс:
+        self._rebuild_ui()
         log_to_gui(t("log_settings_reset"), "INFO")
 
     def _clear_log(self):

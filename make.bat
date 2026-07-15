@@ -1,0 +1,1 @@
+pyinstaller --onefile twitch_ghost_overlay.py --noconsole --icon="icon.ico"
