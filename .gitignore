@@ -166,3 +166,5 @@ emote_cache/
 alerts_config.json
 launcher_state.json
 overlay_config.json
+crash_log.txt
+filters_config.json
