@@ -10,7 +10,6 @@ import threading
 import queue
 import sys
 import traceback
-import concurrent.futures
 from datetime import datetime
 from collections import defaultdict, OrderedDict
 import tkinter as tk
@@ -45,7 +44,7 @@ except ImportError:
 
 # ==================== ИНФОРМАЦИЯ О ПРОГРАММЕ ====================
 APP_NAME = "Twitch Ghost Overlay"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.1"
 APP_AUTHOR = "Tailogs"
 APP_YEAR = "2026"
 APP_DESCRIPTION = "Overlay for Twitch chat with filters and highlights"
@@ -84,6 +83,12 @@ LOG_QUEUE_MAX = 20000
 EMOTE_DL_WORKERS = 8
 EMOTE_RETRY_MAX = 30
 EMOTE_RETRY_DELAY = 300
+EMOTE_DOWNLOAD_QUEUE_MAX = 512
+EMOTE_FAIL_TTL = 300
+MAX_EMOTE_FAILED = 1000
+
+TRANSLATE_WORKERS = 4
+TRANSLATE_QUEUE_MAX = 64
 
 # Популярные Twitch-боты (для автофильтра)
 KNOWN_BOTS = [
@@ -93,9 +98,10 @@ KNOWN_BOTS = [
     "creatisbot", "botrixoficial", "own3d", "tangiabot", "slanderbot",
 ]
 
-_translate_pool = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="Translate"
-)
+_translate_queue = queue.Queue(maxsize=TRANSLATE_QUEUE_MAX)
+_translate_pending_keys = set()
+_translate_pending_lock = threading.Lock()
+_translate_workers_started = False
 
 _emote_lock = threading.RLock()
 _emote_images = {}
@@ -106,11 +112,13 @@ _emote_lru = OrderedDict()
 _emote_pil_cache = OrderedDict()
 _emote_pil_pending = set()
 _emote_pil_lock = threading.RLock()
-_emote_download_queue = queue.Queue()
+_emote_download_queue = queue.Queue(maxsize=EMOTE_DOWNLOAD_QUEUE_MAX)
 _emote_download_queued = set()
 _emote_download_inflight = set()
 _emote_download_lock = threading.RLock()
 _emote_download_workers_started = False
+_emote_failed_until = {}
+_emote_failed_lock = threading.RLock()
 
 HEARTBEAT_INTERVAL = 5
 
@@ -927,8 +935,27 @@ def translate_if_needed(text: str):
         return text, None
 
 
-def translate_async(text, callback):
-    def _do():
+def _ensure_translate_workers():
+    global _translate_workers_started
+    if _translate_workers_started:
+        return
+    _translate_workers_started = True
+    for i in range(TRANSLATE_WORKERS):
+        try:
+            threading.Thread(
+                target=_translate_worker,
+                daemon=True, name=f"Translate-{i}").start()
+        except Exception:
+            pass
+
+
+def _translate_worker():
+    while not should_stop.is_set():
+        try:
+            text, callback = _translate_queue.get(timeout=2.0)
+        except queue.Empty:
+            continue
+        key = text.lower().strip() if isinstance(text, str) else ""
         try:
             original, translated = translate_if_needed(text)
             if callback:
@@ -938,8 +965,33 @@ def translate_async(text, callback):
                     pass
         except Exception:
             pass
+        finally:
+            if key:
+                with _translate_pending_lock:
+                    _translate_pending_keys.discard(key)
+            try:
+                _translate_queue.task_done()
+            except Exception:
+                pass
+
+
+def translate_async(text, callback):
     try:
-        _translate_pool.submit(_do)
+        if not isinstance(text, str) or not text:
+            return
+        key = text.lower().strip()
+        with _translate_pending_lock:
+            if key in _translate_pending_keys:
+                return
+            if _translate_queue.qsize() >= TRANSLATE_QUEUE_MAX:
+                return
+            _translate_pending_keys.add(key)
+        _ensure_translate_workers()
+        try:
+            _translate_queue.put_nowait((text, callback))
+        except queue.Full:
+            with _translate_pending_lock:
+                _translate_pending_keys.discard(key)
     except Exception:
         pass
 
@@ -1863,6 +1915,8 @@ class GhostOverlay:
         self.settings_mode = False
         self._message_queue = []
         self._queue_lock = threading.RLock()
+        self._ui_queue = deque()
+        self._ui_queue_lock = threading.Lock()
         self.message_blocks = []
         self.message_index_by_id = {}
         self._rendering_items = []
@@ -1908,9 +1962,44 @@ class GhostOverlay:
         self.root.after(200, self._make_click_through)
         self.root.after(500, self._keep_topmost_loop)
         self.root.after(33, self._process_queue)
+        self.root.after(30, self._drain_ui_queue)
 
     def _touch_main_heartbeat(self):
         _main_thread_heartbeat[0] = time.time()
+
+    def post_to_ui(self, fn):
+        """Schedule a callable on the Tk main thread from any thread."""
+        try:
+            with self._ui_queue_lock:
+                if len(self._ui_queue) >= 500:
+                    self._ui_queue.popleft()
+                self._ui_queue.append(fn)
+        except Exception:
+            pass
+
+    def _drain_ui_queue(self):
+        if not self.running:
+            return
+        processed = 0
+        try:
+            while processed < 200:
+                with self._ui_queue_lock:
+                    if not self._ui_queue:
+                        break
+                    fn = self._ui_queue.popleft()
+                processed += 1
+                try:
+                    fn()
+                except Exception as e:
+                    log_to_gui(f"UI dispatch error: {e}", "ERROR")
+        except Exception as e:
+            log_to_gui(f"_drain_ui_queue error: {e}", "ERROR")
+        finally:
+            if self.running:
+                try:
+                    self.root.after(30, self._drain_ui_queue)
+                except Exception:
+                    pass
 
     def _get_bg_color_with_alpha(self):
         return self.cfg.get('bg_color', '#0a0a0a')
@@ -2287,10 +2376,7 @@ class GhostOverlay:
                         is_only_emotes = True
             alert = check_message_for_alerts(message)
             if alert:
-                try:
-                    self.root.after(0, lambda a=alert: self.trigger_alert(a))
-                except Exception:
-                    pass
+                self.post_to_ui(lambda a=alert: self.trigger_alert(a))
             has_emotes = bool(emotes_raw)
             result = process_message_pipeline(
                 username, message,
@@ -2442,7 +2528,7 @@ class GhostOverlay:
                     except Exception as e:
                         log_to_gui(f"Alert PIL prep error: {e}", "WARN")
                 try:
-                    self.root.after(0, lambda: _do_alert(pil_bundle))
+                    self.post_to_ui(lambda: _do_alert(pil_bundle))
                 except Exception:
                     pass
 
@@ -2611,6 +2697,7 @@ class GhostOverlay:
     def _process_queue(self):
         if not self.running:
             return
+        remaining = []
         try:
             self._touch_main_heartbeat()
             with self._queue_lock:
@@ -2653,12 +2740,13 @@ class GhostOverlay:
                 self._redraw_settings_border()
         except Exception as e:
             log_to_gui(f"_process_queue error: {e}", "ERROR")
-        if self.running:
-            try:
-                delay = 20 if remaining else 40
-                self.root.after(delay, self._process_queue)
-            except Exception:
-                pass
+        finally:
+            if self.running:
+                try:
+                    delay = 20 if remaining else 40
+                    self.root.after(delay, self._process_queue)
+                except Exception:
+                    pass
 
     def _do_clear(self):
         try:
@@ -3522,13 +3610,19 @@ class ControlPanel:
 
     def open(self):
         try:
-            if self.is_open and self.window is not None:
+            if self.window is not None:
                 try:
-                    self.window.lift()
-                    self.window.focus_force()
-                    return
+                    if self.window.winfo_exists():
+                        if not self.is_open:
+                            self.is_open = True
+                            self._start_polls()
+                        self.window.deiconify()
+                        self.window.lift()
+                        self.window.focus_force()
+                        return
                 except Exception:
                     pass
+                self.window = None
             self.window = tk.Toplevel(self.overlay.root)
             self.window.title(f"{t('app_title')} v{APP_VERSION}")
             self.window.configure(bg='#1e1e1e')
@@ -3540,12 +3634,39 @@ class ControlPanel:
             self.window.minsize(850, 600)
             self._build_all()
             self.is_open = True
+            self._start_polls()
+            self.window.bind('<Destroy>', lambda e: self._save_on_close())
+            self.window.bind('<Map>', self._on_map)
+        except Exception as e:
+            log_to_gui(f"ControlPanel.open error: {e}", "ERROR")
+
+    def _start_polls(self):
+        try:
+            if self.window is None:
+                return
+            for attr in ('_status_poll_id', '_log_poll_id', '_stats_poll_id'):
+                pid = getattr(self, attr, None)
+                if pid:
+                    try:
+                        self.window.after_cancel(pid)
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
             self._poll_logs()
             self._poll_stats()
             self._poll_status()
-            self.window.bind('<Destroy>', lambda e: self._save_on_close())
-        except Exception as e:
-            log_to_gui(f"ControlPanel.open error: {e}", "ERROR")
+        except Exception:
+            pass
+
+    def _on_map(self, event=None):
+        try:
+            if event is not None and event.widget is not self.window:
+                return
+            if not self.is_open:
+                self.is_open = True
+                self._start_polls()
+        except Exception:
+            pass
 
     def _show_about(self):
         try:
@@ -3875,9 +3996,14 @@ class ControlPanel:
                     self.connect_btn.config(state='normal', bg='#9146FF')
                 if self.disconnect_btn:
                     self.disconnect_btn.config(state='disabled', bg='#444444')
-            self._status_poll_id = self.window.after(500, self._poll_status)
         except Exception:
             pass
+        finally:
+            if self.is_open and self.window is not None:
+                try:
+                    self._status_poll_id = self.window.after(500, self._poll_status)
+                except Exception:
+                    pass
 
     def _build_log_tab(self, parent):
         try:
@@ -4552,9 +4678,14 @@ class ControlPanel:
                     self.log_text.config(state='normal')
                     self.log_text.delete('1.0', f'{line_count - self.max_log_lines}.0')
                     self.log_text.config(state='disabled')
-            self._log_poll_id = self.window.after(100, self._poll_logs)
         except Exception:
             pass
+        finally:
+            if self.is_open and self.window is not None:
+                try:
+                    self._log_poll_id = self.window.after(100, self._poll_logs)
+                except Exception:
+                    pass
 
     def _append_log(self, item):
         try:
@@ -4604,9 +4735,14 @@ class ControlPanel:
             for k, v in updates.items():
                 if k in self.stats_labels:
                     self.stats_labels[k].config(text=v)
-            self._stats_poll_id = self.window.after(1000, self._poll_stats)
         except Exception:
             pass
+        finally:
+            if self.is_open and self.window is not None:
+                try:
+                    self._stats_poll_id = self.window.after(1000, self._poll_stats)
+                except Exception:
+                    pass
 
     def _on_close(self):
         try:
@@ -4626,12 +4762,28 @@ class ControlPanel:
                         self.window.after_cancel(pid)
                     except Exception:
                         pass
-            try:
-                if self.window:
-                    self.window.destroy()
-            except Exception:
-                pass
-            self.window = None
+            self._status_poll_id = None
+            self._log_poll_id = None
+            self._stats_poll_id = None
+            # Keep the window object alive so reopening from the tray is instant
+            # instead of rebuilding every widget. If the tray is unavailable,
+            # minimise to the taskbar so the window remains reachable.
+            if self.window:
+                use_tray = False
+                try:
+                    use_tray = bool(self.tray_ref and self.tray_ref.is_available())
+                except Exception:
+                    pass
+                try:
+                    if use_tray:
+                        self.window.withdraw()
+                    else:
+                        self.window.iconify()
+                except Exception:
+                    try:
+                        self.window.withdraw()
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -4869,11 +5021,27 @@ class TrayManager:
 
     def _open_panel(self, icon=None, item=None):
         try:
-            self.overlay.root.after_idle(self.control_panel.open)
+            self.overlay.post_to_ui(self.control_panel.open)
         except Exception:
             pass
 
     def _quit(self, icon=None, item=None):
+        try:
+            should_stop.set()
+            try:
+                chat_command.put_nowait("STOP")
+            except Exception:
+                pass
+            self.overlay.post_to_ui(self._quit_on_ui)
+            if self.icon:
+                try:
+                    self.icon.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _quit_on_ui(self):
         try:
             try:
                 if (self.control_panel.window and
@@ -4886,16 +5054,6 @@ class TrayManager:
                         save_app_state(state)
             except Exception:
                 pass
-            should_stop.set()
-            try:
-                chat_command.put_nowait("STOP")
-            except Exception:
-                pass
-            if self.icon:
-                try:
-                    self.icon.stop()
-                except Exception:
-                    pass
             self.overlay.close()
         except Exception:
             pass
@@ -4915,8 +5073,7 @@ class TrayManager:
 
     def _show_about(self, icon=None, item=None):
         try:
-            if self.overlay.root:
-                self.overlay.root.after_idle(self.control_panel._show_about)
+            self.overlay.post_to_ui(self.control_panel._show_about)
         except Exception:
             pass
 
@@ -4928,14 +5085,27 @@ class TrayManager:
         except Exception:
             pass
 
+    def is_available(self):
+        try:
+            return bool(TRAY_OK and PIL_OK and self.icon is not None and
+                        getattr(self.icon, 'visible', False))
+        except Exception:
+            return False
+
     def start(self):
         if not TRAY_OK or not PIL_OK:
+            log_to_gui("Tray unavailable (pystray/Pillow missing)", "WARN")
             return
         try:
             self.icon = pystray.Icon(
                 "TwitchOverlay", self._create_icon_image(),
                 "Twitch Ghost Overlay", self._build_menu())
-            threading.Thread(target=self._run_icon, daemon=True).start()
+            threading.Thread(target=self._run_icon, daemon=True,
+                             name="TrayIcon").start()
+            try:
+                self.overlay.root.after(2000, self._ensure_visible)
+            except Exception:
+                pass
         except Exception as e:
             log_to_gui(f"Tray start error: {e}", "WARN")
 
@@ -4943,6 +5113,20 @@ class TrayManager:
         try:
             if self.icon:
                 self.icon.run()
+        except Exception as e:
+            log_to_gui(f"Tray icon thread error: {e}", "WARN")
+
+    def _ensure_visible(self):
+        try:
+            if self.icon is not None and not getattr(self.icon, 'visible', False):
+                self.icon.visible = True
+        except Exception as e:
+            log_to_gui(f"Tray icon could not be shown: {e}", "WARN")
+
+    def stop(self):
+        try:
+            if self.icon:
+                self.icon.stop()
         except Exception:
             pass
 
@@ -5124,6 +5308,39 @@ def _ensure_pil_cached(emote_id, path):
             _emote_pil_pending.discard(emote_id)
 
 
+def _emote_failed_recently(emote_id):
+    try:
+        now = time.monotonic()
+        with _emote_failed_lock:
+            until = _emote_failed_until.get(emote_id)
+            if until is None:
+                return False
+            if until > now:
+                return True
+            _emote_failed_until.pop(emote_id, None)
+            return False
+    except Exception:
+        return False
+
+
+def _mark_emote_failed(emote_id):
+    try:
+        with _emote_failed_lock:
+            _emote_failed_until[emote_id] = time.monotonic() + EMOTE_FAIL_TTL
+            while len(_emote_failed_until) > MAX_EMOTE_FAILED:
+                _emote_failed_until.pop(next(iter(_emote_failed_until)))
+    except Exception:
+        pass
+
+
+def _clear_emote_failure(emote_id):
+    try:
+        with _emote_failed_lock:
+            _emote_failed_until.pop(emote_id, None)
+    except Exception:
+        pass
+
+
 def _emote_download_worker():
     while not should_stop.is_set():
         try:
@@ -5139,7 +5356,10 @@ def _emote_download_worker():
                 if not path:
                     path = download_emote(eid)
                 if path:
+                    _clear_emote_failure(eid)
                     _ensure_pil_cached(eid, path)
+                else:
+                    _mark_emote_failed(eid)
             finally:
                 with _emote_download_lock:
                     _emote_download_inflight.discard(eid)
@@ -5180,6 +5400,8 @@ def preload_emote_async(emote_id):
                 return
             if emote_id in _emote_pil_pending:
                 return
+        if _emote_failed_recently(emote_id):
+            return
         with _emote_download_lock:
             if emote_id in _emote_download_queued or emote_id in _emote_download_inflight:
                 return
@@ -5889,7 +6111,7 @@ def run_overlay():
         except Exception:
             pass
         try:
-            _translate_pool.shutdown(wait=False)
+            tray.stop()
         except Exception:
             pass
         log_to_gui("Overlay закрыт", "INFO")
